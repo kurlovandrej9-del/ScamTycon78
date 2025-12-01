@@ -1,9 +1,11 @@
 
 export enum Tab {
   CLICKER = 'CLICKER',   // Default view
-  MARKET = 'MARKET',     // Merged: Upgrades (Soft/Tools) + Traffic
-  MANAGEMENT = 'MANAGEMENT', // Merged: Career + Team/Business
-  LIFESTYLE = 'LIFESTYLE'
+  MARKET = 'MARKET',     // Upgrades
+  MANAGEMENT = 'MANAGEMENT', // Business + Laundering
+  SCHEMES = 'SCHEMES',   // New: Active tasks (Temki)
+  LIFESTYLE = 'LIFESTYLE',
+  PROFILE = 'PROFILE'    
 }
 
 export enum VerticalType {
@@ -14,21 +16,76 @@ export enum VerticalType {
   TRADE = 'Трейд',
   TRAFFIC = 'Трафик',
   OFFICE = 'Офис',
-  LIFESTYLE = 'Имущество'
+  LIFESTYLE = 'Имущество',
+  LAUNDERING = 'Обмыв',
+  DARK = 'Чернуха' 
 }
 
 export enum UpgradeType {
-  RENTAL = 'RENTAL',       // Active Click Boosters (Spammers, etc)
-  SOFTWARE = 'SOFTWARE',   // Evolves: Bot -> Site -> App (Passive Base)
-  TRAFFIC = 'TRAFFIC',     // Global Multiplier
+  RENTAL = 'RENTAL',       
+  SOFTWARE = 'SOFTWARE',   
+  TRAFFIC = 'TRAFFIC',     
+  BLACK_MARKET = 'BLACK_MARKET' 
 }
 
 export enum BusinessStage {
   NONE = 'NONE',
-  REMOTE_TEAM = 'REMOTE_TEAM', // Required for Team Lead
-  OFFICE = 'OFFICE',           // Required for Head
-  NETWORK = 'NETWORK'          // Required for CEO
+  REMOTE_TEAM = 'REMOTE_TEAM', 
+  OFFICE = 'OFFICE',           
+  NETWORK = 'NETWORK'          
 }
+
+export enum TeamStrategy {
+  SAFE = 'SAFE',       
+  BALANCED = 'BALANCED', 
+  AGGRESSIVE = 'AGGRESSIVE' 
+}
+
+// --- TRADING / EXCHANGE TYPES ---
+export enum AssetType {
+  CRYPTO = 'CRYPTO',
+  STOCK = 'STOCK',
+  RESOURCE = 'RESOURCE'
+}
+
+export interface AssetItem {
+  id: string;
+  symbol: string;
+  name: string;
+  type: AssetType;
+  basePrice: number;
+  volatility: number; 
+  icon: string;
+}
+
+// --- SCHEMES (ТЕМКИ) ---
+export enum SchemeCategory {
+  GREY = 'GREY',   // Internet stuff (Refund, Airdrop)
+  BLACK = 'BLACK'  // Drugs, Guns (High Risk)
+}
+
+export interface SchemeItem {
+  id: string;
+  name: string;
+  description: string;
+  category: SchemeCategory;
+  cost: number;
+  durationSeconds: number; // Time to complete
+  riskPercentage: number;  // 0-100% chance of failure
+  minProfit: number;
+  maxProfit: number;
+  icon: string;
+  reqReputation?: number;
+}
+
+export interface ActiveScheme {
+  id: string; // unique instance id
+  schemeId: string;
+  startTime: number;
+  endTime: number;
+  isReady: boolean;
+}
+// ------------------------------
 
 export interface UpgradeItem {
   id: string;
@@ -40,8 +97,18 @@ export interface UpgradeItem {
   level: number;
   description: string;
   maxLevel?: number;
-  // For Software Evolution
-  tierNames?: string[]; // ["Bot", "Site", "App"]
+  tierNames?: string[]; 
+}
+
+export interface LaunderingItem {
+  id: string;
+  name: string;
+  baseCost: number;
+  baseLimit: number; 
+  baseIncome: number; 
+  description: string;
+  reqBusinessStage: BusinessStage;
+  icon: string;
 }
 
 export interface PropertyItem {
@@ -62,7 +129,7 @@ export interface JobPosition {
   requiredReputation: number;
   costToPromote: number;
   isManager: boolean;
-  reqBusinessStage: BusinessStage; // New Requirement
+  reqBusinessStage: BusinessStage; 
 }
 
 export interface GameEvent {
@@ -76,25 +143,37 @@ export interface GameEvent {
 export interface GameState {
   balance: number;
   lifetimeEarnings: number;
-  profitPerSecond: number;
-  clickValue: number;
-  reputation: number;
   
-  upgrades: Record<string, number>;
-  properties: Record<string, number>;
+  // Stats
+  reputation: number;
+  clickValue: number;
+  profitPerSecond: number; 
+  
+  // Inventory
+  upgrades: Record<string, number>; 
+  properties: Record<string, number>; 
+  launderingUpgrades: Record<string, number>; 
+  
+  // Trading Portfolio
+  ownedAssets: Record<string, number>; 
+  assetPrices: Record<string, number>; 
+  
+  // Active Schemes
+  activeSchemes: ActiveScheme[];
+
   currentJobId: string;
   
   // Business Logic
   hasBusiness: boolean;
-  businessStage: BusinessStage; // Tracks strict stage
+  businessStage: BusinessStage; 
+  teamStrategy: TeamStrategy; 
   workers: number;     
   officeLevel: number;
   officeBranches: number;
   
-  // Business Settings (Nuances)
-  workerSalaryRate: number; // 0.1 to 0.9 (10% to 90%). Affects Efficiency.
+  // Settings
+  workerSalaryRate: number; 
   
-  trafficMultiplier: number;
   lastSaveTime: number;
 }
 
@@ -106,16 +185,23 @@ export const INITIAL_STATE: GameState = {
   reputation: 0,
   upgrades: {},
   properties: {},
+  launderingUpgrades: {}, 
+  
+  ownedAssets: {},
+  assetPrices: {},
+  
+  activeSchemes: [],
+
   currentJobId: 'job_start',
   
   hasBusiness: false,
   businessStage: BusinessStage.NONE,
+  teamStrategy: TeamStrategy.SAFE,
   workers: 0,
   officeLevel: 1,
   officeBranches: 1,
   
-  workerSalaryRate: 0.4, // Default 40% salary to workers
+  workerSalaryRate: 0.4, 
   
-  trafficMultiplier: 1.0,
   lastSaveTime: Date.now()
 };

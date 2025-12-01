@@ -1,148 +1,199 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { GameState, INITIAL_STATE, Tab, UpgradeItem, UpgradeType, GameEvent, PropertyItem, BusinessStage } from './types';
-import { MARKET_ITEMS, CAREER_LADDER, OFFICE_CAPACITY, WORKER_HIRE_COST_BASE, CREATE_TEAM_COST, SKIP_TO_OFFICE_COST, CONVERT_TO_OFFICE_COST, OPEN_NEW_BRANCH_COST, PROPERTIES, RANDOM_EVENTS } from './constants';
+import { GameState, INITIAL_STATE, Tab, UpgradeItem, UpgradeType, GameEvent, PropertyItem, BusinessStage, LaunderingItem, TeamStrategy, AssetItem, VerticalType, SchemeItem, ActiveScheme, SchemeCategory } from './types';
+import { MARKET_ITEMS, CAREER_LADDER, OFFICE_CAPACITY, WORKER_HIRE_COST_BASE, CREATE_TEAM_COST, SKIP_TO_OFFICE_COST, CONVERT_TO_OFFICE_COST, OPEN_NEW_BRANCH_COST, PROPERTIES, RANDOM_EVENTS, LAUNDERING_ITEMS, TEAM_STRATEGIES, BASE_BANK_LIMIT, ASSETS, CHARACTER_STAGES, SCHEMES_LIST } from './constants';
 import { formatMoney, calculateUpgradeCost } from './utils/format';
 import { ClickerCircle } from './components/ClickerCircle';
 import { Navigation } from './components/Navigation';
 import { BottomSheet } from './components/BottomSheet';
+import { MiniGameModal } from './components/MiniGameModal';
 import { 
-  Award, Users, Server, Briefcase, Building2, Zap, Smartphone, 
-  Monitor, Star, Skull, TrendingUp, AlertTriangle, Shield, Bot, 
-  Globe, Cpu, MousePointer, Wallet, Target, ShoppingBag, Plane, Ship, LandPlot, Trophy
+  Award, Users, Briefcase, Building2, Zap, Smartphone, 
+  Monitor, Globe, Cpu, MousePointer, Target, Lock, RefreshCw, BriefcaseBusiness, Info, AlertTriangle, Activity, Settings, User, Battery, Wallet, BarChart2, Gamepad2, Skull, FlaskConical, Flame, Hammer, Crosshair, Timer, HelpCircle, ArrowUpRight, Landmark, ShoppingBag
 } from 'lucide-react';
+
+// --- CENTRALIZED GAME LOGIC ---
+const calculateDerivedStats = (state: GameState) => {
+    // 1. Current Job
+    const currentJob = CAREER_LADDER.find(j => j.id === state.currentJobId) || CAREER_LADDER[0];
+
+    // 2. Bank Limit
+    let bankLimit = BASE_BANK_LIMIT;
+    LAUNDERING_ITEMS.forEach(item => {
+        const level = state.launderingUpgrades[item.id] || 0;
+        bankLimit += level * item.baseLimit;
+    });
+
+    // 3. Multipliers (Traffic & Tools)
+    let trafficMultiplier = 1.0;
+    let clickRentalBuff = 0;
+    let basePotentialPerWorker = 0;
+    let hasSoftware = false;
+    let blackMarketPassive = 0;
+
+    MARKET_ITEMS.forEach(u => {
+        const level = state.upgrades[u.id] || 0;
+        if (level > 0) {
+            if (u.type === UpgradeType.TRAFFIC) trafficMultiplier += u.baseProfit * level;
+            if (u.type === UpgradeType.RENTAL) clickRentalBuff += u.baseProfit * level;
+            if (u.type === UpgradeType.SOFTWARE) {
+                basePotentialPerWorker += u.baseProfit * level;
+                hasSoftware = true;
+            }
+            if (u.type === UpgradeType.BLACK_MARKET) {
+                blackMarketPassive += u.baseProfit * level;
+            }
+        }
+    });
+
+    // 4. Scam Income (Business)
+    let scamIncome = 0;
+    if (state.hasBusiness) {
+        const strategyMult = TEAM_STRATEGIES[state.teamStrategy]?.multiplier || 1;
+        const totalWorkers = state.workers * state.officeBranches;
+        
+        // Critical Logic: Workers need Software to produce anything
+        if (hasSoftware) {
+            const rawYield = basePotentialPerWorker * totalWorkers;
+            const efficiency = state.workerSalaryRate * 2.5; 
+            const gross = rawYield * efficiency * strategyMult;
+            const salaryCost = rawYield * state.workerSalaryRate;
+            // Traffic multiplier applies to business income
+            scamIncome = Math.max(0, (gross - salaryCost) * trafficMultiplier);
+        }
+    }
+
+    // 5. Clean Income (Laundering)
+    let cleanIncome = 0;
+    LAUNDERING_ITEMS.forEach(item => {
+        const level = state.launderingUpgrades[item.id] || 0;
+        cleanIncome += level * item.baseIncome;
+    });
+
+    // 6. Total Passive Income
+    const jobPassive = currentJob.isManager ? currentJob.passiveIncome : 0;
+    
+    // Black market adds to total, usually separate from traffic multipliers unless specified
+    const totalPassiveIncome = scamIncome + cleanIncome + jobPassive + (blackMarketPassive * trafficMultiplier);
+
+    // 7. Click Value
+    const baseClick = state.clickValue + clickRentalBuff;
+    const salaryClick = currentJob.salaryPerClick;
+    const currentClickValue = Math.floor((baseClick + salaryClick) * trafficMultiplier);
+
+    // 8. Reputation & Risk
+    let passiveReputation = 0;
+    PROPERTIES.forEach(p => {
+        const count = state.properties?.[p.id] || 0;
+        passiveReputation += count * p.reputationBonus;
+    });
+
+    const strategyRisk = TEAM_STRATEGIES[state.teamStrategy]?.risk || 0;
+    let riskScore = (scamIncome / 1000) + strategyRisk;
+    if (blackMarketPassive > 0) riskScore += 50;
+    
+    const launderingPower = cleanIncome / 500;
+    riskScore = Math.max(0, riskScore - launderingPower);
+    
+    // 9. Portfolio Value
+    let portfolioValue = 0;
+    ASSETS.forEach(a => {
+        const amount = state.ownedAssets[a.id] || 0;
+        const price = state.assetPrices[a.id] || a.basePrice;
+        portfolioValue += amount * price;
+    });
+
+    return {
+        currentJob,
+        bankLimit,
+        trafficMultiplier,
+        basePotentialPerWorker,
+        hasSoftware,
+        scamIncome,
+        cleanIncome,
+        blackMarketPassive,
+        totalPassiveIncome,
+        currentClickValue,
+        passiveReputation,
+        isBankFull: state.balance >= bankLimit,
+        portfolioValue
+    };
+};
+
+// Helper for character image
+const getCharacterImageIndex = (jobId: string, balance: number): number => {
+  const jobIndex = CAREER_LADDER.findIndex(j => j.id === jobId);
+  let stageIndex = jobIndex >= 0 ? jobIndex : 0;
+
+  if (stageIndex === CAREER_LADDER.length - 1) { // CEO
+     if (balance > 100_000_000) return 10; // Ultra Rich
+     if (balance > 10_000_000) return 9; // Very Rich
+     if (balance > 1_000_000) return 8; // Rich
+  }
+  
+  return Math.min(stageIndex, CHARACTER_STAGES.length - 1);
+};
 
 const App: React.FC = () => {
   // --- STATE ---
   const [gameState, setGameState] = useState<GameState>(() => {
-    const saved = localStorage.getItem('scamTycoonSaveV12'); 
-    return saved ? { ...INITIAL_STATE, ...JSON.parse(saved) } : INITIAL_STATE;
+    try {
+        const saved = localStorage.getItem('scamTycoonSaveV21_Refactor'); 
+        if (saved) {
+            const parsed = JSON.parse(saved);
+            return {
+                ...INITIAL_STATE,
+                ...parsed,
+                // Fallbacks for array/object structures to prevent crashes on version update
+                ownedAssets: parsed.ownedAssets || {},
+                assetPrices: parsed.assetPrices || {},
+                launderingUpgrades: parsed.launderingUpgrades || {},
+                upgrades: parsed.upgrades || {},
+                properties: parsed.properties || {},
+                activeSchemes: parsed.activeSchemes || []
+            };
+        }
+    } catch (e) {
+        console.error("Save file corrupted, resetting", e);
+    }
+    return INITIAL_STATE;
   });
 
   const [activeTab, setActiveTab] = useState<Tab>(Tab.CLICKER);
+  const [isManualOpen, setIsManualOpen] = useState(false);
   const [clicks, setClicks] = useState<{ id: number; x: number; y: number; val: string }[]>([]);
   const [offlineEarnings, setOfflineEarnings] = useState<number | null>(null);
   const [activeEvent, setActiveEvent] = useState<GameEvent | null>(null);
   
-  // Local UI State
-  const [marketSubTab, setMarketSubTab] = useState<'TOOLS' | 'SOFT' | 'TRAFFIC'>('TOOLS');
-  const [manageSubTab, setManageSubTab] = useState<'CAREER' | 'BUSINESS'>('CAREER');
+  // Mini Game State
+  const [activeMiniGame, setActiveMiniGame] = useState<string | null>(null);
+
+  // Local UI State - Redefined for new Structure
+  const [businessTab, setBusinessTab] = useState<'TEAM' | 'SOFT' | 'TRAFFIC'>('TEAM');
+  const [financeTab, setFinanceTab] = useState<'LAUNDERING' | 'EXCHANGE' | 'TOOLS'>('LAUNDERING');
+  const [schemesTab, setSchemesTab] = useState<'ACTIVE' | 'BLACK_MARKET'>('ACTIVE');
 
   // --- DERIVED STATE ---
-  const currentJob = useMemo(() => 
-    CAREER_LADDER.find(j => j.id === gameState.currentJobId) || CAREER_LADDER[0], 
-    [gameState.currentJobId]
-  );
-  
-  const nextJob = useMemo(() => {
-    const idx = CAREER_LADDER.findIndex(j => j.id === gameState.currentJobId);
-    return CAREER_LADDER[idx + 1] || null;
-  }, [gameState.currentJobId]);
+  const stats = calculateDerivedStats(gameState);
+  const limitPercent = Math.min(100, (gameState.balance / stats.bankLimit) * 100);
+  const characterStageIndex = getCharacterImageIndex(gameState.currentJobId, gameState.balance);
+  const characterImage = CHARACTER_STAGES[characterStageIndex];
 
-  const currentOfficeSpace = useMemo(() => 
-    OFFICE_CAPACITY.find(o => o.level === gameState.officeLevel) || OFFICE_CAPACITY[0],
-    [gameState.officeLevel]
-  );
-
-  // --- REVENUE LOGIC ---
-  const rentalClickBuff = useMemo(() => {
-    let buff = 0;
-    MARKET_ITEMS.forEach(u => {
-      if (u.type === UpgradeType.RENTAL) {
-        const level = gameState.upgrades[u.id] || 0;
-        buff += u.baseProfit * level;
-      }
-    });
-    return buff;
-  }, [gameState.upgrades]);
-
-  const trafficMultiplier = useMemo(() => {
-    let multiplier = 1.0;
-    MARKET_ITEMS.forEach(t => {
-      if (t.type === UpgradeType.TRAFFIC) {
-        const level = gameState.upgrades[t.id] || 0;
-        multiplier += t.baseProfit * level;
-      }
-    });
-    return multiplier;
-  }, [gameState.upgrades]);
-
-  const businessRevenue = useMemo(() => {
-    if (!gameState.hasBusiness) return 0;
-    let basePotentialPerWorker = 0;
-    MARKET_ITEMS.forEach(u => {
-      if (u.type === UpgradeType.SOFTWARE) {
-        const level = gameState.upgrades[u.id] || 0;
-        basePotentialPerWorker += u.baseProfit * level;
-      }
-    });
-    if (basePotentialPerWorker === 0) return 0;
-    // Salary impact calculation
-    const generated = basePotentialPerWorker * gameState.workers * gameState.officeBranches * (gameState.workerSalaryRate * 2.5);
-    const cost = generated * gameState.workerSalaryRate;
-    return generated - cost;
-  }, [gameState.hasBusiness, gameState.workers, gameState.officeBranches, gameState.upgrades, gameState.workerSalaryRate]);
-
-  const effectivePassiveIncome = useMemo(() => {
-    const jobPassive = currentJob.isManager ? currentJob.passiveIncome : 0;
-    return (jobPassive + businessRevenue) * trafficMultiplier;
-  }, [currentJob, businessRevenue, trafficMultiplier]);
-
-  const currentClickValue = useMemo(() => {
-    const base = gameState.clickValue + rentalClickBuff;
-    const salary = currentJob.salaryPerClick;
-    return Math.floor((base + salary) * trafficMultiplier);
-  }, [gameState.clickValue, rentalClickBuff, currentJob, trafficMultiplier]);
-
-  const passiveReputation = useMemo(() => {
-    let repPerSec = 0;
-    PROPERTIES.forEach(p => {
-      const count = gameState.properties?.[p.id] || 0;
-      repPerSec += count * p.reputationBonus;
-    });
-    return repPerSec;
-  }, [gameState.properties]);
-
-  const hasSoftware = useMemo(() => {
-    return MARKET_ITEMS.some(u => u.type === UpgradeType.SOFTWARE && (gameState.upgrades[u.id] || 0) > 0);
-  }, [gameState.upgrades]);
-
-  // Risk / Wanted Level Logic
-  const wantedLevel = useMemo(() => {
-    if (effectivePassiveIncome > 1_000_000) return 5;
-    if (effectivePassiveIncome > 100_000) return 4;
-    if (effectivePassiveIncome > 10_000) return 3;
-    if (effectivePassiveIncome > 1_000) return 2;
-    if (effectivePassiveIncome > 0) return 1;
-    return 0;
-  }, [effectivePassiveIncome]);
-
-  // --- PERSISTENCE & OFFLINE LOGIC ---
-
-  // Ref to hold current state for event listeners to avoid stale closures
+  // --- PERSISTENCE ---
   const gameStateRef = useRef(gameState);
   useEffect(() => {
     gameStateRef.current = gameState;
   }, [gameState]);
 
-  // Save System
   useEffect(() => {
     const handleSave = () => {
       const stateToSave = { ...gameStateRef.current, lastSaveTime: Date.now() };
-      localStorage.setItem('scamTycoonSaveV12', JSON.stringify(stateToSave));
+      localStorage.setItem('scamTycoonSaveV21_Refactor', JSON.stringify(stateToSave));
     };
 
-    // Auto-save interval
     const interval = setInterval(handleSave, 5000);
-
-    // Save on visibility change (mobile app switch) and unload
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') {
-        handleSave();
-      }
-    };
-
+    const handleVisibilityChange = () => { if (document.visibilityState === 'hidden') handleSave(); };
     window.addEventListener('beforeunload', handleSave);
-    window.addEventListener('pagehide', handleSave); // Better for mobile iOS
+    window.addEventListener('pagehide', handleSave);
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
@@ -153,20 +204,56 @@ const App: React.FC = () => {
     };
   }, []);
 
-  // Offline Earnings Check (Run once on mount)
+  // --- TRADING LOOP ---
+  useEffect(() => {
+     setGameState(prev => {
+         const newPrices = { ...prev.assetPrices };
+         let changed = false;
+         ASSETS.forEach(a => {
+             if (newPrices[a.id] === undefined) {
+                 newPrices[a.id] = a.basePrice;
+                 changed = true;
+             }
+         });
+         return changed ? { ...prev, assetPrices: newPrices } : prev;
+     });
+
+     const tradeInterval = setInterval(() => {
+         setGameState(prev => {
+             const newPrices = { ...prev.assetPrices };
+             ASSETS.forEach(a => {
+                 const current = newPrices[a.id] || a.basePrice;
+                 const changePercent = (Math.random() - 0.5) * 2 * a.volatility;
+                 let trend = 1;
+                 if (Math.random() < 0.05) trend = 1.15; // Pump
+                 if (Math.random() < 0.05) trend = 0.85; // Dump
+                 let nextPrice = current * (1 + changePercent) * trend;
+                 if (nextPrice < 0.01) nextPrice = 0.01;
+                 newPrices[a.id] = parseFloat(nextPrice.toFixed(4));
+             });
+             return { ...prev, assetPrices: newPrices };
+         });
+     }, 3000); 
+     return () => clearInterval(tradeInterval);
+  }, []);
+
+  // --- OFFLINE EARNINGS ---
   useEffect(() => {
     if (gameState.lastSaveTime && gameState.profitPerSecond > 0) {
       const now = Date.now();
       const diffSeconds = Math.floor((now - gameState.lastSaveTime) / 1000);
       if (diffSeconds > 60) {
-        const earnings = Math.floor(gameState.profitPerSecond * diffSeconds);
-        const offlineRep = Math.floor(passiveReputation * diffSeconds);
-        if (earnings > 0 || offlineRep > 0) {
-          setOfflineEarnings(earnings);
+        const s = calculateDerivedStats(gameState);
+        const potentialEarnings = Math.floor(s.totalPassiveIncome * diffSeconds);
+        const availableSpace = s.bankLimit - gameState.balance;
+        const actualEarnings = Math.min(potentialEarnings, availableSpace);
+        const offlineRep = Math.floor(s.passiveReputation * diffSeconds);
+        if (actualEarnings > 0 || offlineRep > 0) {
+          setOfflineEarnings(actualEarnings);
           setGameState(prev => ({
             ...prev,
-            balance: prev.balance + earnings,
-            lifetimeEarnings: prev.lifetimeEarnings + earnings,
+            balance: prev.balance + actualEarnings,
+            lifetimeEarnings: prev.lifetimeEarnings + actualEarnings,
             reputation: prev.reputation + offlineRep
           }));
         }
@@ -174,85 +261,78 @@ const App: React.FC = () => {
     }
   }, []); 
 
-  // Game Loop (Delta Time based for background throttling support)
+  // --- SCHEMES TIMER LOOP ---
+  useEffect(() => {
+    const interval = setInterval(() => {
+       setGameState(prev => {
+           let changed = false;
+           const now = Date.now();
+           const updatedSchemes = prev.activeSchemes.map(s => {
+               if (!s.isReady && now >= s.endTime) {
+                   changed = true;
+                   return { ...s, isReady: true };
+               }
+               return s;
+           });
+           
+           if (!changed) return prev;
+           return { ...prev, activeSchemes: updatedSchemes };
+       });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // --- GAME LOOP ---
   useEffect(() => {
     let lastTime = Date.now();
-    
     const interval = setInterval(() => {
       const now = Date.now();
       const deltaSeconds = (now - lastTime) / 1000;
       lastTime = now;
 
-      // Only process if time has passed (prevents processing on 0 delta)
-      // Delta time handles browser throttling (e.g. if tab sleeps 1 min, delta is 60)
       if (deltaSeconds > 0) {
-        setGameState(prev => ({
-          ...prev,
-          balance: prev.balance + (effectivePassiveIncome * deltaSeconds),
-          lifetimeEarnings: prev.lifetimeEarnings + (effectivePassiveIncome * deltaSeconds),
-          reputation: prev.reputation + (passiveReputation * deltaSeconds),
-          profitPerSecond: effectivePassiveIncome,
-          trafficMultiplier
-        }));
-      }
-    }, 1000); // 1 tick per second target
-
-    return () => clearInterval(interval);
-  }, [effectivePassiveIncome, trafficMultiplier, passiveReputation]);
-
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (gameState.balance > 5000 && Math.random() < 0.15) {
-        const event = RANDOM_EVENTS[Math.floor(Math.random() * RANDOM_EVENTS.length)];
-        setActiveEvent(event);
         setGameState(prev => {
-          let change = 0;
-          if (event.type === 'BAD' && event.effectValue < 0 && event.effectValue > -1) {
-            change = Math.floor(prev.balance * event.effectValue);
-          } else {
-             change = Math.floor(event.effectValue * trafficMultiplier);
-          }
-          return { ...prev, balance: Math.max(0, prev.balance + change) };
+          const s = calculateDerivedStats(prev);
+          const income = s.totalPassiveIncome * deltaSeconds;
+          const potentialBalance = prev.balance + income;
+          const actualBalance = Math.min(potentialBalance, s.bankLimit);
+          return {
+            ...prev,
+            balance: actualBalance,
+            lifetimeEarnings: prev.lifetimeEarnings + income,
+            reputation: prev.reputation + (s.passiveReputation * deltaSeconds),
+            profitPerSecond: s.totalPassiveIncome, 
+          };
         });
-        setTimeout(() => setActiveEvent(null), 5000);
       }
-    }, 20000);
+    }, 1000); 
     return () => clearInterval(interval);
-  }, [gameState.balance, trafficMultiplier]);
-
+  }, []);
 
   // --- ACTIONS ---
-
   const handleClick = (e: React.MouseEvent | React.TouchEvent) => {
+    if (stats.isBankFull && navigator.vibrate) navigator.vibrate([50, 50, 50]);
     let clientX, clientY;
-    if ('touches' in e) {
-      clientX = e.touches[0].clientX;
-      clientY = e.touches[0].clientY;
-    } else {
-      clientX = (e as React.MouseEvent).clientX;
-      clientY = (e as React.MouseEvent).clientY;
-    }
-    
-    // Add jitter
-    const jitterX = (Math.random() - 0.5) * 50;
-    const jitterY = (Math.random() - 0.5) * 50;
-    
+    if ('touches' in e) { clientX = e.touches[0].clientX; clientY = e.touches[0].clientY; } 
+    else { clientX = (e as React.MouseEvent).clientX; clientY = (e as React.MouseEvent).clientY; }
+    const jitterX = (Math.random() - 0.5) * 80;
+    const jitterY = (Math.random() - 0.5) * 80;
     const id = Date.now();
-    setClicks(prev => [...prev, { 
-      id, 
-      x: clientX + jitterX, 
-      y: clientY + jitterY, 
-      val: `+$${formatMoney(currentClickValue)}` 
-    }]);
-    
+    setClicks(prev => [...prev, { id, x: clientX + jitterX, y: clientY + jitterY, val: stats.isBankFull ? 'ПОЛНО' : `+${formatMoney(stats.currentClickValue)}` }]);
     setTimeout(() => setClicks(prev => prev.filter(c => c.id !== id)), 800);
-    setGameState(prev => ({
-      ...prev,
-      balance: prev.balance + currentClickValue,
-      lifetimeEarnings: prev.lifetimeEarnings + currentClickValue,
-      reputation: prev.reputation + 1
-    }));
+    
+    if (!stats.isBankFull) {
+        setGameState(prev => {
+            const s = calculateDerivedStats(prev);
+            const potential = prev.balance + s.currentClickValue;
+            return {
+                ...prev,
+                balance: Math.min(potential, s.bankLimit),
+                lifetimeEarnings: prev.lifetimeEarnings + s.currentClickValue,
+                reputation: prev.reputation + 0.1 
+            }
+        });
+    }
   };
 
   const buyUpgrade = (upgrade: UpgradeItem) => {
@@ -260,11 +340,7 @@ const App: React.FC = () => {
     if (upgrade.maxLevel && currentLevel >= upgrade.maxLevel) return;
     const cost = calculateUpgradeCost(upgrade.baseCost, currentLevel);
     if (gameState.balance >= cost) {
-      setGameState(prev => ({
-        ...prev,
-        balance: prev.balance - cost,
-        upgrades: { ...prev.upgrades, [upgrade.id]: currentLevel + 1 }
-      }));
+      setGameState(prev => ({ ...prev, balance: prev.balance - cost, upgrades: { ...prev.upgrades, [upgrade.id]: currentLevel + 1 } }));
     }
   };
 
@@ -272,11 +348,7 @@ const App: React.FC = () => {
     const currentCount = gameState.properties?.[item.id] || 0;
     const cost = calculateUpgradeCost(item.baseCost, currentCount);
     if (gameState.balance >= cost) {
-      setGameState(prev => ({
-        ...prev,
-        balance: prev.balance - cost,
-        properties: { ...prev.properties, [item.id]: currentCount + 1 }
-      }));
+      setGameState(prev => ({ ...prev, balance: prev.balance - cost, properties: { ...prev.properties, [item.id]: currentCount + 1 } }));
     }
   };
 
@@ -284,21 +356,114 @@ const App: React.FC = () => {
     const targetJob = CAREER_LADDER.find(j => j.id === jobId);
     if (!targetJob) return;
     if (gameState.balance >= targetJob.costToPromote && gameState.reputation >= targetJob.requiredReputation) {
-      setGameState(prev => ({
-        ...prev,
-        balance: prev.balance - targetJob.costToPromote,
-        currentJobId: jobId
-      }));
+      setGameState(prev => ({ ...prev, balance: prev.balance - targetJob.costToPromote, currentJobId: jobId }));
     }
   };
 
-  const actionWrapper = (cost: number, action: () => void) => {
-     if (gameState.balance >= cost) {
-       action();
-     }
+  const upgradeLaunderingItem = (item: LaunderingItem) => {
+      const currentLevel = gameState.launderingUpgrades[item.id] || 0;
+      const cost = calculateUpgradeCost(item.baseCost, currentLevel);
+      if (gameState.balance >= cost) {
+          setGameState(prev => ({ ...prev, balance: prev.balance - cost, launderingUpgrades: { ...prev.launderingUpgrades, [item.id]: currentLevel + 1 } }));
+      }
+  }
+
+  const buyAsset = (asset: AssetItem) => {
+      const price = gameState.assetPrices[asset.id] || asset.basePrice;
+      if (gameState.balance >= price) {
+          setGameState(prev => ({
+              ...prev,
+              balance: prev.balance - price,
+              ownedAssets: { ...prev.ownedAssets, [asset.id]: (prev.ownedAssets[asset.id] || 0) + 1 }
+          }));
+      }
   };
 
-  // --- HELPERS ---
+  const sellAsset = (asset: AssetItem) => {
+      const owned = gameState.ownedAssets[asset.id] || 0;
+      const price = gameState.assetPrices[asset.id] || asset.basePrice;
+      if (owned >= 1) {
+          setGameState(prev => {
+              const s = calculateDerivedStats(prev);
+              const potential = prev.balance + price;
+              const actual = Math.min(potential, s.bankLimit);
+              return {
+                  ...prev,
+                  balance: actual,
+                  ownedAssets: { ...prev.ownedAssets, [asset.id]: prev.ownedAssets[asset.id] - 1 }
+              };
+          });
+      }
+  };
+  
+  const handleMiniGameComplete = (reward: number) => {
+      if (reward > 0) {
+        setGameState(prev => {
+             const s = calculateDerivedStats(prev);
+             return {
+                 ...prev,
+                 balance: Math.min(prev.balance + reward, s.bankLimit * 1.5), 
+                 lifetimeEarnings: prev.lifetimeEarnings + reward
+             }
+        });
+      }
+      setActiveMiniGame(null);
+  };
+
+  // --- SCHEME LOGIC ---
+  const startScheme = (scheme: SchemeItem) => {
+      if (gameState.balance >= scheme.cost) {
+          const newScheme: ActiveScheme = {
+              id: Date.now().toString() + Math.random(),
+              schemeId: scheme.id,
+              startTime: Date.now(),
+              endTime: Date.now() + (scheme.durationSeconds * 1000),
+              isReady: false
+          };
+          
+          setGameState(prev => ({
+              ...prev,
+              balance: prev.balance - scheme.cost,
+              activeSchemes: [...prev.activeSchemes, newScheme]
+          }));
+      }
+  };
+
+  const claimScheme = (activeScheme: ActiveScheme) => {
+      const schemeDef = SCHEMES_LIST.find(s => s.id === activeScheme.schemeId);
+      if (!schemeDef) return;
+
+      const isSuccess = Math.random() * 100 > schemeDef.riskPercentage;
+      
+      if (isSuccess) {
+          const profit = Math.floor(Math.random() * (schemeDef.maxProfit - schemeDef.minProfit + 1)) + schemeDef.minProfit;
+          
+          setGameState(prev => {
+               const s = calculateDerivedStats(prev);
+               return {
+                  ...prev,
+                  balance: Math.min(prev.balance + profit, s.bankLimit),
+                  lifetimeEarnings: prev.lifetimeEarnings + profit,
+                  reputation: prev.reputation + 5,
+                  activeSchemes: prev.activeSchemes.filter(s => s.id !== activeScheme.id)
+               }
+          });
+          
+          setActiveEvent({ id: 'scheme_win', title: 'Темка Зашла!', message: `Вы подняли кэш на ${schemeDef.name}`, type: 'GOOD', effectValue: profit });
+          setTimeout(() => setActiveEvent(null), 3000);
+
+      } else {
+          setGameState(prev => ({
+              ...prev,
+              activeSchemes: prev.activeSchemes.filter(s => s.id !== activeScheme.id)
+          }));
+           setActiveEvent({ id: 'scheme_loss', title: 'Мамонт Сорвался', message: `Вас кинули на теме ${schemeDef.name}`, type: 'BAD', effectValue: 0 });
+           setTimeout(() => setActiveEvent(null), 3000);
+      }
+  };
+
+
+  // --- UI COMPONENTS HELPER ---
   const getSoftTier = (u: UpgradeItem, level: number) => {
     if (!u.tierNames) return '';
     if (level === 0) return 'Не куплено';
@@ -307,489 +472,809 @@ const App: React.FC = () => {
     return u.tierNames[2];
   };
 
-  const getMarketIcon = (id: string) => {
-     if (id.includes('proxy')) return <Shield size={18} />;
+  const getMarketIcon = (id: string, vertical: VerticalType) => {
+     if (vertical === VerticalType.DARK) {
+         if (id.includes('courier') || id.includes('grow')) return <FlaskConical size={18} />;
+         if (id.includes('guns')) return <Crosshair size={18} />;
+         if (id.includes('hitman')) return <Skull size={18} />;
+         if (id.includes('thugs')) return <Hammer size={18} />;
+         return <Flame size={18} />;
+     }
+
+     if (id.includes('proxy') || id.includes('vpn')) return <Globe size={18} />;
      if (id.includes('spam')) return <Monitor size={18} />;
      if (id.includes('sms')) return <Smartphone size={18} />;
-     if (id.includes('parser')) return <Bot size={18} />;
-     if (id.includes('cloaka')) return <Globe size={18} />;
-     
+     if (id.includes('parser') || id.includes('checker')) return <Cpu size={18} />;
+     if (id.includes('cloaka')) return <Lock size={18} />;
      if (id.includes('dating')) return <Users size={24} />;
      if (id.includes('escort')) return <Award size={24} />;
      if (id.includes('shop')) return <Target size={24} />;
      if (id.includes('crypto')) return <Cpu size={24} />;
-     
-     if (id.includes('google')) return <Globe size={18} />;
-     if (id.includes('fb')) return <Users size={18} />;
      return <Zap size={18} />;
   }
 
-  const getPropertyIcon = (id: string, img: string) => {
-    switch (id) {
-        case 'prop_gucci': return <ShoppingBag size={32} className="text-pink-500" />;
-        case 'prop_tesla': return <Zap size={32} className="text-blue-500" />;
-        case 'prop_heli': return <Plane size={32} className="text-slate-600" />;
-        case 'prop_yacht': return <Ship size={32} className="text-blue-400" />;
-        case 'prop_island': return <LandPlot size={32} className="text-green-500" />;
-        case 'prop_club': return <Trophy size={32} className="text-yellow-500" />;
-        default: return <span className="text-4xl">{img}</span>;
-    }
-  }
+  // --- TAB RENDERERS ---
 
-  const renderStars = (count: number) => (
-    <div className="flex space-x-0.5">
-      {[1,2,3,4,5].map(i => (
-        <Star 
-          key={i} 
-          size={14} 
-          fill={i <= count ? '#F59E0B' : 'none'} 
-          className={i <= count ? 'text-yellow-500 animate-pulse drop-shadow-sm' : 'text-gray-300'} 
-        />
-      ))}
-    </div>
-  );
+  // 1. BUSINESS TAB (Workers, Soft, Traffic)
+  const renderBusiness = () => {
+    const currentOfficeSpace = OFFICE_CAPACITY.find(o => o.level === gameState.officeLevel) || OFFICE_CAPACITY[0];
 
-  // --- SUB-RENDERERS ---
+    return (
+      <div className="animate-fade-in pb-24">
+        {/* SUB TABS */}
+        <div className="flex bg-surfaceHighlight p-1.5 rounded-2xl mb-6">
+            <button onClick={() => setBusinessTab('TEAM')} className={`relative flex-1 py-3 rounded-xl text-[10px] font-black tracking-wider transition-all ${businessTab === 'TEAM' ? 'bg-primary text-white shadow-md' : 'text-slate-400 hover:text-white'}`}>
+                КОМАНДА
+            </button>
+            <button onClick={() => setBusinessTab('SOFT')} className={`relative flex-1 py-3 rounded-xl text-[10px] font-black tracking-wider transition-all ${businessTab === 'SOFT' ? 'bg-primary text-white shadow-md' : 'text-slate-400 hover:text-white'}`}>
+                СОФТ
+                {!stats.hasSoftware && gameState.workers > 0 && <span className="absolute top-1 right-2 w-2 h-2 bg-red-500 rounded-full animate-pulse"/>}
+            </button>
+            <button onClick={() => setBusinessTab('TRAFFIC')} className={`relative flex-1 py-3 rounded-xl text-[10px] font-black tracking-wider transition-all ${businessTab === 'TRAFFIC' ? 'bg-primary text-white shadow-md' : 'text-slate-400 hover:text-white'}`}>
+                ТРАФИК
+            </button>
+        </div>
 
-  const renderMarket = () => (
-    <div className="animate-fade-in">
-      <div className="flex bg-slate-200 p-1 rounded-2xl mb-6">
-        {[
-          { id: 'TOOLS', label: 'ИНСТРУМЕНТЫ' },
-          { id: 'SOFT', label: 'БОТЫ' },
-          { id: 'TRAFFIC', label: 'ТРАФИК' }
-        ].map(tab => (
-          <button
-            key={tab.id}
-            onClick={() => setMarketSubTab(tab.id as any)}
-            className={`flex-1 py-3 rounded-xl text-[11px] font-black tracking-wider transition-all ${marketSubTab === tab.id ? 'bg-white text-slate-800 shadow-md' : 'text-slate-500'}`}>
-            {tab.label}
-          </button>
-        ))}
-      </div>
+        {/* TEAM SECTION */}
+        {businessTab === 'TEAM' && (
+            <div className="space-y-6">
+                {!gameState.hasBusiness ? (
+                    <div className="bg-surface p-6 rounded-3xl text-center border border-dashed border-white/10">
+                        <div className="w-16 h-16 bg-surfaceHighlight rounded-full mx-auto mb-4 flex items-center justify-center text-3xl">👨‍💻</div>
+                        <h3 className="text-xl font-black text-white mb-2">Старт Бизнеса</h3>
+                        <p className="text-xs text-slate-400 mb-6 leading-relaxed">Воркеры - это основа пассивного дохода. Создай команду, чтобы начать путь к миллионам. Тебе потребуется софт и трафик для них.</p>
+                        
+                        <div className="bg-surfaceHighlight p-4 rounded-xl mb-6 text-left">
+                            <div className="text-[10px] text-slate-500 font-bold uppercase mb-1">Требования:</div>
+                            <div className="flex items-center gap-2 text-xs font-bold text-slate-300">
+                                <span className={stats.hasSoftware ? 'text-success' : 'text-red-400'}>{stats.hasSoftware ? '✅' : '❌'} Куплен любой Софт</span>
+                            </div>
+                            <div className="flex items-center gap-2 text-xs font-bold text-slate-300">
+                                <span className={gameState.balance >= CREATE_TEAM_COST ? 'text-success' : 'text-red-400'}>{gameState.balance >= CREATE_TEAM_COST ? '✅' : '❌'} {formatMoney(CREATE_TEAM_COST)} на счету</span>
+                            </div>
+                        </div>
 
-      <div className="space-y-4">
-        {marketSubTab === 'TOOLS' && MARKET_ITEMS.filter(u => u.type === UpgradeType.RENTAL).map(u => {
-           const level = gameState.upgrades[u.id] || 0;
-           const cost = calculateUpgradeCost(u.baseCost, level);
-           const canBuy = gameState.balance >= cost;
-           return (
-             <div key={u.id} className="bg-white p-4 rounded-3xl flex justify-between items-center shadow-sm border border-slate-100 relative overflow-hidden group">
-               {canBuy && <div className="absolute top-0 right-0 w-3 h-3 bg-green-500 rounded-full animate-ping m-3" />}
-               <div className="flex items-center gap-4 flex-1 z-10">
-                 <div className="p-3 bg-indigo-50 text-indigo-500 rounded-2xl">
-                    {getMarketIcon(u.id)}
+                        <button onClick={() => {
+                            setGameState(prev => ({
+                                ...prev, balance: prev.balance - CREATE_TEAM_COST,
+                                hasBusiness: true, businessStage: BusinessStage.REMOTE_TEAM,
+                                workers: 0, officeLevel: 1, officeBranches: 1
+                            }));
+                        }} disabled={!stats.hasSoftware || gameState.balance < CREATE_TEAM_COST} className={`w-full py-4 rounded-2xl font-black uppercase tracking-widest active:scale-95 transition-transform ${!stats.hasSoftware || gameState.balance < CREATE_TEAM_COST ? 'bg-surfaceHighlight text-slate-500 cursor-not-allowed' : 'bg-accent text-white shadow-lg shadow-accent/20'}`}>
+                            Создать Команду
+                        </button>
+                    </div>
+                ) : (
+                    <div className="bg-surface p-6 rounded-3xl relative overflow-hidden">
+                        {/* Warnings */}
+                        {!stats.hasSoftware && gameState.workers > 0 && (
+                            <div className="mb-4 bg-red-500/10 p-3 rounded-2xl flex items-center gap-3 border border-red-500/20">
+                                <AlertTriangle className="text-red-500 flex-shrink-0" size={20} />
+                                <div className="text-[10px] font-bold text-red-500 uppercase leading-tight">Воркеры не приносят прибыль без софта! Купите софт во вкладке.</div>
+                            </div>
+                        )}
+
+                        <div className="flex justify-between items-center mb-6">
+                            <div>
+                                <div className="text-[10px] text-slate-400 uppercase font-bold tracking-widest mb-1">Уровень Офиса</div>
+                                <div className="text-xl font-black text-white">{currentOfficeSpace.name}</div>
+                            </div>
+                            <div className="text-right">
+                                <div className="text-[10px] text-slate-400 uppercase font-bold tracking-widest mb-1">Профит Команды</div>
+                                <div className="text-xl font-mono font-black text-success">+{formatMoney(stats.scamIncome)}/сек</div>
+                            </div>
+                        </div>
+
+                        {/* Workers Bar */}
+                        <div className="bg-surfaceHighlight p-4 rounded-2xl mb-4">
+                            <div className="flex justify-between text-xs font-bold text-slate-400 uppercase mb-2">
+                                <span>Штат Сотрудников</span>
+                                <span>{gameState.workers} / {currentOfficeSpace.maxWorkers * gameState.officeBranches}</span>
+                            </div>
+                            <div className="w-full bg-slate-700 h-2 rounded-full overflow-hidden">
+                                <div className="bg-accent h-full rounded-full transition-all duration-500" style={{width: `${(gameState.workers / (currentOfficeSpace.maxWorkers * gameState.officeBranches)) * 100}%`}}></div>
+                            </div>
+                        </div>
+
+                        {/* Strategy Selector */}
+                        <div className="text-[10px] text-slate-500 font-bold uppercase mb-2 ml-1">Стратегия Работы</div>
+                        <div className="grid grid-cols-3 gap-2 mb-6">
+                            {Object.values(TeamStrategy).map((strat) => (
+                                <button key={strat} onClick={() => setGameState(prev => ({...prev, teamStrategy: strat as TeamStrategy}))} className={`p-2 rounded-xl border transition-all ${gameState.teamStrategy === strat ? 'border-transparent bg-white text-black' : 'border-transparent bg-surfaceHighlight text-slate-500'}`}>
+                                    <div className="text-[9px] font-black uppercase text-center">{TEAM_STRATEGIES[strat].name}</div>
+                                </button>
+                            ))}
+                        </div>
+
+                        <button onClick={() => setGameState(prev => ({ ...prev, balance: prev.balance - calculateUpgradeCost(WORKER_HIRE_COST_BASE, gameState.workers), workers: prev.workers + 1 }))} 
+                            disabled={gameState.workers >= currentOfficeSpace.maxWorkers * gameState.officeBranches || gameState.balance < calculateUpgradeCost(WORKER_HIRE_COST_BASE, gameState.workers)}
+                            className="w-full py-4 bg-accent text-white font-black rounded-2xl hover:brightness-110 disabled:opacity-50 disabled:bg-surfaceHighlight disabled:text-slate-500 transition-all active:scale-95 shadow-lg shadow-accent/20 flex flex-col items-center leading-none gap-1">
+                            <span>НАНЯТЬ ВОРКЕРА</span>
+                            <span className="text-[10px] opacity-80 font-mono font-medium">{formatMoney(calculateUpgradeCost(WORKER_HIRE_COST_BASE, gameState.workers))}</span>
+                        </button>
+                    </div>
+                )}
+            </div>
+        )}
+
+        {/* SOFT SECTION */}
+        {businessTab === 'SOFT' && (
+             <div className="space-y-4">
+                 <div className="p-4 bg-primary/10 rounded-2xl text-xs text-primary font-bold border border-primary/20 mb-2">
+                     💡 Софт необходим, чтобы воркеры приносили доход. Чем лучше софт, тем больше приносит каждый воркер.
                  </div>
-                 <div>
-                    <div className="text-slate-800 font-black text-sm uppercase">{u.name}</div>
-                    <div className="text-xs text-slate-500 mb-1">{u.description}</div>
-                 </div>
-               </div>
-               <button onClick={() => buyUpgrade(u)} disabled={!canBuy} className={`z-10 px-4 py-3 rounded-xl text-xs font-black font-mono transition-all transform active:scale-95 ${canBuy ? 'bg-green-500 text-white shadow-lg shadow-green-200' : 'bg-slate-100 text-slate-400'}`}>
-                 ${formatMoney(cost)}
-               </button>
+                 {MARKET_ITEMS.filter(u => u.type === UpgradeType.SOFTWARE).map(u => {
+                    const level = gameState.upgrades[u.id] || 0;
+                    const cost = calculateUpgradeCost(u.baseCost, level);
+                    const canBuy = gameState.balance >= cost;
+                    return (
+                        <div key={u.id} className="bg-surface p-5 rounded-3xl">
+                            <div className="flex justify-between items-start mb-3">
+                                <div className="flex items-center gap-3">
+                                    <div className="p-3 bg-surfaceHighlight text-secondary rounded-2xl">{getMarketIcon(u.id, u.vertical)}</div>
+                                    <div>
+                                        <div className="text-white font-black text-sm uppercase">{u.name}</div>
+                                        <div className="text-[10px] text-slate-400 font-bold bg-surfaceHighlight px-2 py-0.5 rounded w-fit mt-1">{getSoftTier(u, level)}</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="text-xs text-slate-400 mb-3 font-medium">{u.description}</div>
+                            <button onClick={() => buyUpgrade(u)} disabled={!canBuy} className={`w-full py-3 rounded-2xl text-xs font-black uppercase tracking-widest active:scale-95 transition-transform ${canBuy ? 'bg-secondary text-white' : 'bg-surfaceHighlight text-slate-500'}`}>
+                            {level === 0 ? 'КУПИТЬ' : 'УЛУЧШИТЬ'} {formatMoney(cost)}
+                            </button>
+                        </div>
+                    );
+                })}
              </div>
-           );
-        })}
+        )}
 
-        {marketSubTab === 'SOFT' && MARKET_ITEMS.filter(u => u.type === UpgradeType.SOFTWARE).map(u => {
-           const level = gameState.upgrades[u.id] || 0;
-           const cost = calculateUpgradeCost(u.baseCost, level);
-           const canBuy = gameState.balance >= cost;
-           return (
-             <div key={u.id} className="relative bg-white p-5 rounded-3xl border border-slate-100 group shadow-sm">
-                <div className="flex justify-between items-start mb-3">
-                  <div className="flex items-center gap-3">
-                    <div className="p-3 bg-orange-50 text-orange-500 rounded-2xl">
-                        {getMarketIcon(u.id)}
-                    </div>
-                    <div>
-                        <div className="text-slate-800 font-black text-sm uppercase">{u.name}</div>
-                        <div className="text-xs text-slate-400 font-bold mt-0.5">{getSoftTier(u, level)} (ур.{level})</div>
-                    </div>
-                  </div>
-                  <div className="text-right">
-                    <div className="text-[10px] text-slate-400 font-bold uppercase">Доход</div>
-                    <div className="text-sm font-mono font-black text-green-500">+${u.baseProfit * (level || 1)}</div>
-                  </div>
-                </div>
-                
-                <button onClick={() => buyUpgrade(u)} disabled={!canBuy} className={`w-full py-3 rounded-xl text-xs font-black uppercase tracking-widest transition-transform active:scale-95 ${canBuy ? 'bg-orange-500 text-white shadow-lg shadow-orange-200' : 'bg-slate-100 text-slate-400'}`}>
-                  Купить ${formatMoney(cost)}
+        {/* TRAFFIC SECTION */}
+        {businessTab === 'TRAFFIC' && (
+             <div className="space-y-4">
+                 <div className="p-4 bg-primary/10 rounded-2xl text-xs text-primary font-bold border border-primary/20 mb-2">
+                     📈 Трафик работает как множитель дохода. +10% Трафика = +10% к доходу всей команды.
+                 </div>
+                 {MARKET_ITEMS.filter(u => u.type === UpgradeType.TRAFFIC).map(u => {
+                    const level = gameState.upgrades[u.id] || 0;
+                    const cost = calculateUpgradeCost(u.baseCost, level);
+                    const canBuy = gameState.balance >= cost;
+                    return (
+                        <div key={u.id} className="bg-surface p-4 rounded-3xl flex justify-between items-center">
+                        <div className="flex items-center gap-4 flex-1">
+                            <div className="p-3 bg-surfaceHighlight text-primary rounded-2xl">{getMarketIcon(u.id, u.vertical)}</div>
+                            <div>
+                                <div className="text-white font-black text-sm">{u.name}</div>
+                                <div className="text-xs text-primary font-bold mt-1">+{Math.round(u.baseProfit * 100)}% ДОХОД</div>
+                            </div>
+                        </div>
+                        <button onClick={() => buyUpgrade(u)} disabled={!canBuy} className={`px-4 py-3 rounded-2xl text-xs font-black font-mono transition-transform active:scale-95 ${canBuy ? 'bg-primary text-white' : 'bg-surfaceHighlight text-slate-500'}`}>
+                            {formatMoney(cost)}
+                        </button>
+                        </div>
+                    );
+                })}
+             </div>
+        )}
+      </div>
+    );
+  };
+
+  // 2. TEMKI TAB (Schemes, Dark Market)
+  const renderSchemesTab = () => {
+    const activeList = gameState.activeSchemes;
+    const now = Date.now();
+
+    return (
+        <div className="animate-fade-in pb-24">
+             {/* SUB TABS */}
+            <div className="flex bg-surfaceHighlight p-1.5 rounded-2xl mb-6">
+                <button onClick={() => setSchemesTab('ACTIVE')} className={`relative flex-1 py-3 rounded-xl text-[10px] font-black tracking-wider transition-all ${schemesTab === 'ACTIVE' ? 'bg-white text-black shadow-md' : 'text-slate-400 hover:text-white'}`}>
+                    СХЕМЫ
+                    {activeList.some(s => s.isReady) && <span className="absolute top-1 right-2 w-2 h-2 bg-success rounded-full animate-pulse"/>}
                 </button>
-             </div>
-           );
-        })}
+                <button onClick={() => setSchemesTab('BLACK_MARKET')} className={`relative flex-1 py-3 rounded-xl text-[10px] font-black tracking-wider transition-all ${schemesTab === 'BLACK_MARKET' ? 'bg-red-600 text-white shadow-md' : 'text-slate-400 hover:text-white'}`}>
+                    ЧЕРНУХА
+                </button>
+            </div>
 
-        {marketSubTab === 'TRAFFIC' && MARKET_ITEMS.filter(u => u.type === UpgradeType.TRAFFIC).map(u => {
-           const level = gameState.upgrades[u.id] || 0;
-           const cost = calculateUpgradeCost(u.baseCost, level);
-           const canBuy = gameState.balance >= cost;
-           return (
-             <div key={u.id} className="bg-white p-4 rounded-3xl flex justify-between items-center shadow-sm border border-slate-100">
-               <div className="flex items-center gap-4 flex-1">
-                 <div className="p-3 bg-purple-50 text-purple-500 rounded-2xl">
-                    {getMarketIcon(u.id)}
-                 </div>
-                 <div>
-                    <div className="text-slate-800 font-black text-sm">{u.name}</div>
-                    <div className="text-xs text-purple-500 font-bold mt-1">+{u.baseProfit * 100}% К профиту</div>
-                 </div>
-               </div>
-               <button onClick={() => buyUpgrade(u)} disabled={!canBuy} className={`px-4 py-3 rounded-xl text-xs font-black font-mono transition-transform active:scale-95 ${canBuy ? 'bg-purple-500 text-white shadow-lg shadow-purple-200' : 'bg-slate-200 text-slate-400'}`}>
-                 ${formatMoney(cost)}
-               </button>
-             </div>
-           );
-        })}
-      </div>
-    </div>
-  );
+            {schemesTab === 'ACTIVE' && (
+                <div className="space-y-6">
+                    {/* Active Status */}
+                    {activeList.length > 0 && (
+                        <div className="space-y-3">
+                            <h4 className="text-xs text-slate-400 font-bold uppercase tracking-widest pl-2">В Процессе</h4>
+                            {activeList.map(scheme => {
+                                const def = SCHEMES_LIST.find(s => s.id === scheme.schemeId);
+                                if (!def) return null;
+                                const timeLeft = Math.max(0, Math.ceil((scheme.endTime - now) / 1000));
+                                const progress = Math.min(100, ((now - scheme.startTime) / (scheme.endTime - scheme.startTime)) * 100);
+                                const isBlack = def.category === SchemeCategory.BLACK;
 
-  const renderManagement = () => (
-    <div className="animate-fade-in">
-       <div className="flex bg-slate-200 p-1 rounded-2xl mb-6">
-        <button onClick={() => setManageSubTab('CAREER')} className={`flex-1 py-3 rounded-xl text-[11px] font-black tracking-wider transition-all ${manageSubTab === 'CAREER' ? 'bg-white text-slate-800 shadow-md' : 'text-slate-500'}`}>КАРЬЕРА</button>
-        <button onClick={() => setManageSubTab('BUSINESS')} className={`flex-1 py-3 rounded-xl text-[11px] font-black tracking-wider transition-all ${manageSubTab === 'BUSINESS' ? 'bg-white text-slate-800 shadow-md' : 'text-slate-500'}`}>СИНДИКАТ</button>
-      </div>
-
-      {manageSubTab === 'CAREER' && (
-        <div className="space-y-4">
-           {CAREER_LADDER.map((job, idx) => {
-             const currentIdx = CAREER_LADDER.findIndex(j => j.id === gameState.currentJobId);
-             if (idx < currentIdx) return null; 
-             const isNext = idx === currentIdx + 1;
-             if (!isNext && idx !== currentIdx) return null; 
-
-             if (idx === currentIdx) {
-                return (
-                  <div key={job.id} className="bg-slate-800 p-6 rounded-[2rem] text-white shadow-xl relative overflow-hidden">
-                    <div className="absolute top-0 right-0 p-6 opacity-10"><Briefcase size={80}/></div>
-                    <div className="text-slate-400 text-[10px] uppercase tracking-widest mb-1 font-bold">Текущий статус</div>
-                    <div className="text-3xl font-black mb-1">{job.title}</div>
-                    <div className="text-sm text-purple-400 font-bold mb-6 bg-white/10 w-fit px-3 py-1 rounded-full">{job.vertical}</div>
-                    <div className="grid grid-cols-2 gap-4">
-                        <div className="bg-white/10 p-3 rounded-2xl text-center backdrop-blur-sm">
-                            <div className="text-[10px] text-slate-300 font-bold uppercase">За клик</div>
-                            <div className="text-white font-mono font-bold text-lg">+${job.salaryPerClick}</div>
-                        </div>
-                        <div className="bg-white/10 p-3 rounded-2xl text-center backdrop-blur-sm">
-                            <div className="text-[10px] text-slate-300 font-bold uppercase">Пассив</div>
-                            <div className="text-green-400 font-mono font-bold text-lg">+${job.passiveIncome}</div>
-                        </div>
-                    </div>
-                  </div>
-                )
-             }
-
-             const hasRep = gameState.reputation >= job.requiredReputation;
-             const hasMoney = gameState.balance >= job.costToPromote;
-             let businessReqMet = true;
-             
-             if (job.reqBusinessStage === BusinessStage.REMOTE_TEAM) businessReqMet = gameState.businessStage !== BusinessStage.NONE;
-             else if (job.reqBusinessStage === BusinessStage.OFFICE) businessReqMet = gameState.businessStage === BusinessStage.OFFICE || gameState.businessStage === BusinessStage.NETWORK;
-             else if (job.reqBusinessStage === BusinessStage.NETWORK) businessReqMet = gameState.businessStage === BusinessStage.NETWORK;
-
-             const canPromote = hasRep && hasMoney && businessReqMet;
-
-             return (
-               <div key={job.id} className="p-5 bg-white rounded-[2rem] border-2 border-dashed border-slate-200">
-                  <div className="flex justify-between items-center mb-3">
-                    <span className="font-black text-lg text-slate-700">{job.title}</span>
-                    <div className="bg-slate-100 px-3 py-1 rounded-lg text-[10px] text-slate-500 font-bold uppercase">ЗАКРЫТО 🔒</div>
-                  </div>
-                  <div className="space-y-2 mb-4 bg-slate-50 p-3 rounded-xl">
-                    <div className={`flex justify-between text-xs font-bold ${hasRep ? "text-green-600" : "text-red-500"}`}>
-                        <span>Нужна репутация:</span> <span>{job.requiredReputation} 💎</span>
-                    </div>
-                    <div className={`flex justify-between text-xs font-bold ${hasMoney ? "text-green-600" : "text-red-500"}`}>
-                        <span>Стоимость:</span> <span>${formatMoney(job.costToPromote)}</span>
-                    </div>
-                    {job.reqBusinessStage !== BusinessStage.NONE && (
-                        <div className={`flex justify-between text-xs font-bold ${businessReqMet ? "text-green-600" : "text-red-500"}`}>
-                            <span>Офис:</span> <span>Нужен</span>
+                                return (
+                                    <div key={scheme.id} className={`p-4 rounded-3xl border ${isBlack ? 'bg-red-950/10 border-red-500/30' : 'bg-surface border-white/5'} relative overflow-hidden`}>
+                                        <div className="flex justify-between items-center mb-2 relative z-10">
+                                            <div className="flex items-center gap-3">
+                                                <div className="text-xl">{def.icon}</div>
+                                                <span className="font-bold text-sm text-white">{def.name}</span>
+                                            </div>
+                                            {scheme.isReady ? (
+                                                <button onClick={() => claimScheme(scheme)} className="bg-success text-white px-4 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider animate-pulse">Забрать</button>
+                                            ) : (
+                                                <span className="font-mono text-xs text-slate-400">{Math.floor(timeLeft / 60)}:{(timeLeft % 60).toString().padStart(2, '0')}</span>
+                                            )}
+                                        </div>
+                                        {!scheme.isReady && (
+                                            <div className="h-1.5 w-full bg-surfaceHighlight rounded-full overflow-hidden relative z-10">
+                                                <div className={`h-full transition-all duration-1000 linear ${isBlack ? 'bg-red-500' : 'bg-primary'}`} style={{ width: `${progress}%` }}/>
+                                            </div>
+                                        )}
+                                    </div>
+                                )
+                            })}
                         </div>
                     )}
-                  </div>
-                  <button disabled={!canPromote} onClick={() => promote(job.id)} className={`w-full py-4 rounded-xl font-black text-sm tracking-widest uppercase transition-all transform active:scale-95 ${canPromote ? 'bg-green-500 text-white shadow-lg shadow-green-200 hover:bg-green-600' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}>
-                    Повышение ⬆️
-                  </button>
-               </div>
-             )
-           })}
+
+                    {/* Grey Schemes List */}
+                    <div className="space-y-4">
+                        <h4 className="text-xs text-slate-400 font-bold uppercase tracking-widest pl-2">Доступные Темы</h4>
+                        {SCHEMES_LIST.filter(s => s.category === SchemeCategory.GREY).map(scheme => {
+                             const canAfford = gameState.balance >= scheme.cost;
+                             return (
+                                 <div key={scheme.id} className="p-5 rounded-3xl relative overflow-hidden group bg-surface">
+                                     <div className="flex justify-between items-start mb-4 relative z-10">
+                                          <div className="flex items-center gap-4">
+                                              <div className="text-3xl p-3 rounded-2xl bg-surfaceHighlight">{scheme.icon}</div>
+                                              <div>
+                                                  <h4 className="text-white font-black text-sm uppercase">{scheme.name}</h4>
+                                                  <p className="text-[10px] text-slate-400 font-bold mt-1">{scheme.description}</p>
+                                              </div>
+                                          </div>
+                                          <div className={`px-2 py-1 rounded text-[10px] font-black bg-yellow-500 text-black`}>
+                                              RISK {scheme.riskPercentage}%
+                                          </div>
+                                     </div>
+
+                                     <div className="flex justify-between items-center bg-black/20 p-3 rounded-xl mb-4 relative z-10">
+                                         <div className="text-center">
+                                             <div className="text-[9px] text-slate-500 font-bold uppercase">Время</div>
+                                             <div className="text-xs text-white font-mono">{scheme.durationSeconds / 60} мин</div>
+                                         </div>
+                                         <div className="text-center">
+                                             <div className="text-[9px] text-slate-500 font-bold uppercase">Вложения</div>
+                                             <div className="text-xs text-white font-mono">{formatMoney(scheme.cost)}</div>
+                                         </div>
+                                         <div className="text-center">
+                                             <div className="text-[9px] text-slate-500 font-bold uppercase">Выхлоп</div>
+                                             <div className="text-xs text-success font-mono">~{formatMoney(scheme.maxProfit)}</div>
+                                         </div>
+                                     </div>
+
+                                     <button onClick={() => startScheme(scheme)} disabled={!canAfford} className={`w-full py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-transform active:scale-95 ${canAfford ? 'bg-white text-black' : 'bg-surfaceHighlight text-slate-500'}`}>
+                                         НАЧАТЬ ТЕМУ
+                                     </button>
+                                 </div>
+                             )
+                        })}
+                    </div>
+                </div>
+            )}
+
+            {schemesTab === 'BLACK_MARKET' && (
+                <div className="space-y-6">
+                     <div className="p-4 bg-red-900/10 border border-red-500/20 rounded-2xl text-center">
+                         <Skull className="mx-auto text-red-500 mb-2" size={32} />
+                         <h4 className="text-red-500 font-black uppercase text-sm tracking-widest">Черный Рынок</h4>
+                         <p className="text-[10px] text-red-400/70 font-bold mt-1">Здесь покупают товар для перепродажи и запрещенный софт.</p>
+                    </div>
+
+                    {/* Black Schemes (Trade) */}
+                    <h4 className="text-xs text-red-500/70 font-bold uppercase tracking-widest pl-2">Товарка (Опасно)</h4>
+                    <div className="space-y-4">
+                        {SCHEMES_LIST.filter(s => s.category === SchemeCategory.BLACK).map(scheme => {
+                             const canAfford = gameState.balance >= scheme.cost;
+                             return (
+                                 <div key={scheme.id} className="p-5 rounded-3xl relative overflow-hidden group bg-gradient-to-br from-surface to-red-950/20 border border-red-900/10">
+                                     <div className="flex justify-between items-start mb-4 relative z-10">
+                                          <div className="flex items-center gap-4">
+                                              <div className="text-3xl p-3 rounded-2xl bg-red-900/20">{scheme.icon}</div>
+                                              <div>
+                                                  <h4 className="text-white font-black text-sm uppercase">{scheme.name}</h4>
+                                                  <p className="text-[10px] text-slate-400 font-bold mt-1">{scheme.description}</p>
+                                              </div>
+                                          </div>
+                                          <div className="px-2 py-1 rounded text-[10px] font-black bg-red-500 text-white">
+                                              RISK {scheme.riskPercentage}%
+                                          </div>
+                                     </div>
+
+                                     <div className="flex justify-between items-center bg-black/20 p-3 rounded-xl mb-4 relative z-10">
+                                         <div className="text-center">
+                                             <div className="text-[9px] text-slate-500 font-bold uppercase">Ждать</div>
+                                             <div className="text-xs text-white font-mono">{scheme.durationSeconds / 60} мин</div>
+                                         </div>
+                                         <div className="text-center">
+                                             <div className="text-[9px] text-slate-500 font-bold uppercase">Закуп</div>
+                                             <div className="text-xs text-white font-mono">{formatMoney(scheme.cost)}</div>
+                                         </div>
+                                         <div className="text-center">
+                                             <div className="text-[9px] text-slate-500 font-bold uppercase">Навар</div>
+                                             <div className="text-xs text-success font-mono">~{formatMoney(scheme.maxProfit)}</div>
+                                         </div>
+                                     </div>
+
+                                     <button onClick={() => startScheme(scheme)} disabled={!canAfford} className={`w-full py-4 rounded-2xl font-black uppercase tracking-widest text-xs transition-transform active:scale-95 ${canAfford ? 'bg-red-600 text-white shadow-lg shadow-red-600/20' : 'bg-surfaceHighlight text-slate-500'}`}>
+                                         ЗАКУПИТЬ ТОВАР
+                                     </button>
+                                 </div>
+                             )
+                        })}
+                    </div>
+
+                    {/* Black Market Upgrades (Passive) */}
+                    <h4 className="text-xs text-red-500/70 font-bold uppercase tracking-widest pl-2 mt-8">Инфраструктура ОПГ</h4>
+                    {MARKET_ITEMS.filter(u => u.type === UpgradeType.BLACK_MARKET).map(u => {
+                        const level = gameState.upgrades[u.id] || 0;
+                        const cost = calculateUpgradeCost(u.baseCost, level);
+                        const canBuy = gameState.balance >= cost;
+                        return (
+                            <div key={u.id} className="bg-surface border border-red-900/20 p-5 rounded-3xl relative overflow-hidden">
+                                    <div className="flex justify-between items-start mb-4 relative z-10">
+                                    <div className="flex items-center gap-3">
+                                        <div className="p-3 bg-red-950/50 text-red-500 rounded-2xl border border-red-500/20">{getMarketIcon(u.id, u.vertical)}</div>
+                                        <div>
+                                            <div className="text-white font-black text-sm uppercase tracking-wide">{u.name}</div>
+                                            <div className="text-[10px] text-red-400/80 font-bold px-2 py-0.5 rounded w-fit mt-1 bg-red-950/40 border border-red-900/20">{getSoftTier(u, level)}</div>
+                                        </div>
+                                    </div>
+                                    <div className="text-right">
+                                            <div className="text-xs font-bold text-red-500">+{formatMoney(u.baseProfit)} / сек</div>
+                                    </div>
+                                </div>
+                                    <button onClick={() => buyUpgrade(u)} disabled={!canBuy} className={`w-full py-4 rounded-2xl text-xs font-black uppercase tracking-[0.2em] active:scale-95 transition-transform ${canBuy ? 'bg-red-600 text-white shadow-lg shadow-red-600/30' : 'bg-surfaceHighlight text-slate-500'}`}>
+                                    КУПИТЬ {formatMoney(cost)}
+                                </button>
+                            </div>
+                        )
+                    })}
+                </div>
+            )}
         </div>
-      )}
+    );
+  };
 
-      {manageSubTab === 'BUSINESS' && (
-        <div className="space-y-6">
-           {!gameState.hasBusiness ? (
-             <div className="flex flex-col gap-4">
-               {/* Option 1: Remote Team */}
-               <div className="bg-white p-5 rounded-[2.5rem] shadow-sm border border-slate-100">
-                  <div className="flex items-center gap-4 mb-4">
-                    <div className="w-12 h-12 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center shrink-0">
-                        <Users size={24} />
-                    </div>
-                    <div>
-                        <h3 className="text-lg font-black text-slate-800">Удаленная Тима</h3>
-                        <p className="text-xs text-slate-500 font-medium">Для новичков. Нанимай воркеров онлайн.</p>
-                    </div>
-                  </div>
-                  <button onClick={() => {
-                       setGameState(prev => ({
-                          ...prev, balance: prev.balance - CREATE_TEAM_COST,
-                          hasBusiness: true, businessStage: BusinessStage.REMOTE_TEAM,
-                          workers: 0, officeLevel: 1, officeBranches: 1
-                      }));
-                  }} disabled={!hasSoftware || gameState.balance < CREATE_TEAM_COST} className={`w-full py-4 rounded-xl font-black uppercase tracking-widest transform transition-transform active:scale-95 ${!hasSoftware || gameState.balance < CREATE_TEAM_COST ? 'bg-slate-200 text-slate-400' : 'bg-blue-500 text-white shadow-lg shadow-blue-200'}`}>
-                    Создать (${formatMoney(CREATE_TEAM_COST)})
-                  </button>
-               </div>
+  // 3. FINANCE TAB (Laundering, Exchange, Tools)
+  const renderFinanceTab = () => {
+    return (
+        <div className="animate-fade-in pb-24">
+             {/* SUB TABS */}
+            <div className="flex bg-surfaceHighlight p-1.5 rounded-2xl mb-6">
+                <button onClick={() => setFinanceTab('LAUNDERING')} className={`relative flex-1 py-3 rounded-xl text-[10px] font-black tracking-wider transition-all ${financeTab === 'LAUNDERING' ? 'bg-primary text-white shadow-md' : 'text-slate-400 hover:text-white'}`}>
+                    ОБМЫВ
+                    {stats.isBankFull && <span className="absolute top-1 right-2 w-2 h-2 bg-red-500 rounded-full animate-pulse"/>}
+                </button>
+                <button onClick={() => setFinanceTab('EXCHANGE')} className={`relative flex-1 py-3 rounded-xl text-[10px] font-black tracking-wider transition-all ${financeTab === 'EXCHANGE' ? 'bg-primary text-white shadow-md' : 'text-slate-400 hover:text-white'}`}>
+                    БИРЖА
+                </button>
+                <button onClick={() => setFinanceTab('TOOLS')} className={`relative flex-1 py-3 rounded-xl text-[10px] font-black tracking-wider transition-all ${financeTab === 'TOOLS' ? 'bg-primary text-white shadow-md' : 'text-slate-400 hover:text-white'}`}>
+                    ИНСТРУМЕНТЫ
+                </button>
+            </div>
 
-               {/* Option 2: Instant Office */}
-               <div className="bg-gradient-to-br from-slate-800 to-slate-900 p-5 rounded-[2.5rem] shadow-xl text-white relative overflow-hidden">
-                  <div className="absolute top-0 right-0 w-32 h-32 bg-white/5 rounded-full -mr-10 -mt-10" />
-                  
-                  <div className="flex items-center gap-4 mb-4 relative z-10">
-                    <div className="w-12 h-12 bg-yellow-500 text-white rounded-full flex items-center justify-center shrink-0 shadow-lg">
-                        <Building2 size={24} />
-                    </div>
-                    <div>
-                        <h3 className="text-lg font-black text-white">Реальный Офис</h3>
-                        <p className="text-xs text-slate-300 font-medium">Сразу в дамки. Пропускаем этап "мамкиного бизнесмена".</p>
-                    </div>
-                  </div>
-                  
-                  <div className="mb-4 text-xs font-mono text-slate-400 bg-black/20 p-2 rounded-lg">
-                    ⚠️ Требует x10 больше вложений, но открывает доступ к топ позициям сразу.
-                  </div>
-
-                  <button onClick={() => {
-                       setGameState(prev => ({
-                          ...prev, balance: prev.balance - SKIP_TO_OFFICE_COST,
-                          hasBusiness: true, businessStage: BusinessStage.OFFICE,
-                          workers: 0, officeLevel: 2, officeBranches: 1
-                      }));
-                  }} disabled={!hasSoftware || gameState.balance < SKIP_TO_OFFICE_COST} className={`w-full py-4 rounded-xl font-black uppercase tracking-widest transform transition-transform active:scale-95 border-2 border-yellow-500/50 ${!hasSoftware || gameState.balance < SKIP_TO_OFFICE_COST ? 'bg-slate-700 text-slate-500' : 'bg-yellow-500 text-slate-900 hover:bg-yellow-400'}`}>
-                    Открыть (${formatMoney(SKIP_TO_OFFICE_COST)})
-                  </button>
-               </div>
-             </div>
-           ) : (
-             <>
-               <div className="bg-white p-6 rounded-[2.5rem] shadow-lg border border-slate-100 relative overflow-hidden">
-                 
-                 <div className="relative z-10">
-                    <div className="flex justify-between items-start mb-4">
-                        <div>
-                            <div className="text-[10px] text-blue-500 font-bold uppercase tracking-wider mb-1">Штаб-квартира</div>
-                            <div className="text-xl font-black text-slate-800">{currentOfficeSpace.name}</div>
-                        </div>
-                        <div className="p-3 bg-blue-50 text-blue-600 rounded-2xl">
-                            <Building2 size={24} />
-                        </div>
+            {financeTab === 'LAUNDERING' && (
+                <div className="space-y-4">
+                    {stats.isBankFull && <div className="p-4 bg-red-500/10 rounded-2xl text-red-500 font-bold text-xs uppercase text-center animate-pulse border border-red-500/20">Банк переполнен! Деньги сгорают!</div>}
+                    <div className="p-4 bg-surfaceHighlight rounded-2xl text-[10px] text-slate-400 font-medium mb-4">
+                        Ваш доход ограничен лимитами банка. Покупайте бизнесы для отмыва, чтобы хранить больше денег.
                     </div>
                     
-                    <div className="flex items-end gap-2 mb-6 bg-slate-50 p-4 rounded-2xl border border-slate-100">
-                         <div className="text-4xl font-black text-green-500 font-mono tracking-tighter">
-                            ${formatMoney(businessRevenue)}
-                         </div>
-                         <div className="text-xs text-slate-400 mb-2 font-bold uppercase">/ сек чистыми</div>
-                    </div>
+                    <div className="grid grid-cols-1 gap-3">
+                        {LAUNDERING_ITEMS.map((item, index) => {
+                            const currentLevel = gameState.launderingUpgrades[item.id] || 0;
+                            const cost = calculateUpgradeCost(item.baseCost, currentLevel);
+                            const canBuy = gameState.balance >= cost;
+                            const canPlay = ['laund_shawarma', 'laund_carwash', 'laund_rest', 'laund_const'].includes(item.id) && currentLevel > 0;
 
-                    <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100 mb-4">
-                        <div className="flex justify-between items-center mb-2">
-                            <span className="text-xs font-bold text-slate-500 uppercase">Зарплата воркерам</span>
-                            <span className="text-xs font-mono font-black text-slate-800">{(gameState.workerSalaryRate * 100).toFixed(0)}%</span>
+                            return (
+                                <div key={item.id} className="p-5 rounded-3xl bg-surface relative overflow-hidden">
+                                    <div className="flex items-center gap-4 mb-3 relative z-10">
+                                        <div className="text-3xl p-3 bg-surfaceHighlight rounded-2xl">{item.icon}</div>
+                                        <div className="flex-1">
+                                            <div className="flex justify-between items-center">
+                                            <h4 className="font-black text-white text-sm">{item.name}</h4>
+                                            <span className="text-[10px] font-bold bg-surfaceHighlight px-2 py-0.5 rounded text-slate-400">Lvl {currentLevel}</span>
+                                            </div>
+                                            <div className="text-[10px] text-slate-400 font-bold mt-1">+{formatMoney(item.baseLimit)} Лимит</div>
+                                        </div>
+                                    </div>
+                                    
+                                    <div className="grid grid-cols-5 gap-2 relative z-10">
+                                        <button onClick={() => upgradeLaunderingItem(item)} disabled={!canBuy} className={`col-span-3 py-3 rounded-2xl text-xs font-black uppercase tracking-widest transition-all active:scale-95 ${canBuy ? 'bg-primary text-white shadow-lg shadow-primary/20' : 'bg-surfaceHighlight text-slate-500'}`}>{`UP ${formatMoney(cost)}`}</button>
+                                        
+                                        {canPlay ? (
+                                            <button onClick={() => setActiveMiniGame(item.id)} className="col-span-2 py-3 bg-accent text-white rounded-2xl flex items-center justify-center transition-all active:scale-95 shadow-lg shadow-accent/20 animate-pop">
+                                                <Gamepad2 size={20} />
+                                            </button>
+                                        ) : (
+                                        <div className="col-span-2 bg-surfaceHighlight rounded-2xl flex items-center justify-center opacity-30 cursor-not-allowed">
+                                            <Lock size={16} />
+                                        </div>
+                                        )}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            )}
+
+            {financeTab === 'EXCHANGE' && (
+                <div className="space-y-3">
+                     <div className="bg-surfaceHighlight p-5 rounded-3xl">
+                        <div className="text-[10px] text-slate-400 uppercase tracking-widest font-bold">Мой Портфель</div>
+                        <div className="text-3xl font-mono font-black mt-1 flex items-center gap-2 text-white">
+                            {formatMoney(stats.portfolioValue)}
+                            <Activity size={20} className="text-primary" />
                         </div>
-                        <input 
-                            type="range" min="0.1" max="0.9" step="0.1" 
-                            value={gameState.workerSalaryRate} 
-                            onChange={(e) => setGameState(prev => ({...prev, workerSalaryRate: parseFloat(e.target.value)}))}
-                            className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-500 mb-2"
-                        />
-                        <div className="text-[10px] text-slate-500 text-center font-medium">Выше зарплата = Выше эффективность (<span className="text-green-600 font-bold">x{(gameState.workerSalaryRate * 2.5).toFixed(1)}</span>)</div>
                     </div>
+                    {ASSETS.map(asset => {
+                        const price = gameState.assetPrices[asset.id] || asset.basePrice;
+                        const owned = gameState.ownedAssets[asset.id] || 0;
+                        const canBuy = gameState.balance >= price;
+                        const canSell = owned > 0;
+                        return (
+                            <div key={asset.id} className="bg-surface p-5 rounded-3xl relative">
+                                <div className="flex justify-between items-center mb-4">
+                                    <div className="flex items-center gap-3">
+                                        <div className="text-2xl bg-surfaceHighlight w-12 h-12 flex items-center justify-center rounded-2xl">{asset.icon}</div>
+                                        <div>
+                                            <div className="font-black text-white">{asset.name}</div>
+                                            <div className="text-[10px] font-bold text-slate-400 bg-surfaceHighlight px-2 py-0.5 rounded w-fit mt-1">{asset.symbol}</div>
+                                        </div>
+                                    </div>
+                                    <div className="text-right">
+                                        <div className="font-mono font-black text-lg text-white">{formatMoney(price)}</div>
+                                    </div>
+                                </div>
+                                <div className="grid grid-cols-2 gap-3">
+                                    <button onClick={() => buyAsset(asset)} disabled={!canBuy} className={`py-3 rounded-2xl font-black text-xs uppercase tracking-wider transition-transform active:scale-95 ${canBuy ? 'bg-success text-white' : 'bg-surfaceHighlight text-slate-500'}`}>Купить</button>
+                                    <button onClick={() => sellAsset(asset)} disabled={!canSell} className={`py-3 rounded-2xl font-black text-xs uppercase tracking-wider transition-transform active:scale-95 ${canSell ? 'bg-secondary text-white' : 'bg-surfaceHighlight text-slate-500'}`}>Продать</button>
+                                </div>
+                            </div>
+                        )
+                    })}
+                </div>
+            )}
 
-                    <div className="grid grid-cols-2 gap-3 mb-4">
-                         <div className="bg-slate-50 p-3 rounded-2xl border border-slate-100 text-center">
-                            <div className="text-[10px] text-slate-400 uppercase font-bold">Воркеры</div>
-                            <div className="text-xl text-slate-800 font-black">{gameState.workers} <span className="text-slate-400 text-xs font-medium">/ {currentOfficeSpace.maxWorkers * gameState.officeBranches}</span></div>
-                         </div>
-                         <div className="bg-slate-50 p-3 rounded-2xl border border-slate-100 text-center">
-                            <div className="text-[10px] text-slate-400 uppercase font-bold">Филиалы</div>
-                            <div className="text-xl text-slate-800 font-black">{gameState.officeBranches}</div>
-                         </div>
+            {financeTab === 'TOOLS' && (
+                <div className="space-y-3">
+                    <div className="p-4 bg-surfaceHighlight rounded-2xl text-[10px] text-slate-400 font-medium mb-2">
+                        Инструменты увеличивают доход с одного клика по кнопке. Полезно для активного старта.
                     </div>
-
-                    <button onClick={() => setGameState(prev => ({ ...prev, balance: prev.balance - calculateUpgradeCost(WORKER_HIRE_COST_BASE, gameState.workers), workers: prev.workers + 1 }))} 
-                        disabled={gameState.workers >= currentOfficeSpace.maxWorkers * gameState.officeBranches || gameState.balance < calculateUpgradeCost(WORKER_HIRE_COST_BASE, gameState.workers)}
-                        className="w-full py-4 bg-slate-800 text-white font-black rounded-xl hover:bg-slate-700 disabled:opacity-50 transition-all active:scale-95 shadow-lg shadow-slate-300">
-                        Нанять воркера 👤 (+${formatMoney(calculateUpgradeCost(WORKER_HIRE_COST_BASE, gameState.workers))})
-                    </button>
-                 </div>
-               </div>
-
-               <div className="grid grid-cols-1 gap-3">
-                 {gameState.businessStage === BusinessStage.REMOTE_TEAM && (
-                    <button onClick={() => actionWrapper(CONVERT_TO_OFFICE_COST, () => setGameState(prev => ({...prev, balance: prev.balance - CONVERT_TO_OFFICE_COST, businessStage: BusinessStage.OFFICE, officeLevel: 2})))} disabled={gameState.balance < CONVERT_TO_OFFICE_COST} 
-                        className="p-5 bg-yellow-50 border-2 border-yellow-200 rounded-2xl text-center">
-                        <div className="text-xs font-black text-yellow-600 uppercase mb-1">Арендовать реальный офис</div>
-                        <div className="text-lg font-mono font-bold text-yellow-800">${formatMoney(CONVERT_TO_OFFICE_COST)}</div>
-                    </button>
-                 )}
-                 {gameState.businessStage !== BusinessStage.REMOTE_TEAM && (
-                    <button onClick={() => actionWrapper(OPEN_NEW_BRANCH_COST, () => setGameState(prev => ({...prev, balance: prev.balance - OPEN_NEW_BRANCH_COST, businessStage: BusinessStage.NETWORK, officeBranches: prev.officeBranches + 1})))} disabled={gameState.balance < OPEN_NEW_BRANCH_COST} 
-                        className="p-5 bg-indigo-50 border-2 border-indigo-200 rounded-2xl text-center">
-                        <div className="text-xs font-black text-indigo-600 uppercase mb-1">Открыть новый филиал</div>
-                        <div className="text-lg font-mono font-bold text-indigo-800">${formatMoney(OPEN_NEW_BRANCH_COST)}</div>
-                    </button>
-                 )}
-               </div>
-             </>
-           )}
+                    {MARKET_ITEMS.filter(u => u.type === UpgradeType.RENTAL).map(u => {
+                        const level = gameState.upgrades[u.id] || 0;
+                        const cost = calculateUpgradeCost(u.baseCost, level);
+                        const canBuy = gameState.balance >= cost;
+                        return (
+                            <div key={u.id} className="bg-surface p-4 rounded-3xl flex justify-between items-center relative overflow-hidden group">
+                            <div className="flex items-center gap-4 flex-1 z-10">
+                                <div className="p-3 rounded-2xl bg-surfaceHighlight text-accent">{getMarketIcon(u.id, u.vertical)}</div>
+                                <div>
+                                    <div className="text-white font-black text-sm uppercase">{u.name}</div>
+                                    <div className="text-xs text-slate-400 font-bold mt-1">Lvl {level} • +{u.baseProfit} TAP</div>
+                                </div>
+                            </div>
+                            <button onClick={() => buyUpgrade(u)} disabled={!canBuy} className={`z-10 px-5 py-3 rounded-2xl text-xs font-black font-mono transition-all active:scale-95 ${canBuy ? 'bg-white text-black' : 'bg-surfaceHighlight text-slate-500'}`}>
+                                {formatMoney(cost)}
+                            </button>
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
         </div>
-      )}
-    </div>
-  );
+    )
+  };
 
+  // 4. LIFESTYLE (Same as before)
   const renderLifestyle = () => (
-    <div className="grid grid-cols-2 gap-3 animate-fade-in">
+    <div className="grid grid-cols-2 gap-3 animate-fade-in pb-24">
       {PROPERTIES.map(p => {
         const count = gameState.properties?.[p.id] || 0;
         const cost = calculateUpgradeCost(p.baseCost, count);
         const canBuy = gameState.balance >= cost;
         return (
-          <button key={p.id} onClick={() => buyProperty(p)} disabled={!canBuy} className={`relative overflow-hidden p-4 rounded-3xl flex flex-col items-center text-center border-2 transition-all transform active:scale-95 ${canBuy ? 'bg-white border-slate-100 shadow-md' : 'bg-slate-100 border-transparent opacity-60'}`}>
-            <div className="text-slate-800 mb-3 drop-shadow-sm transform hover:scale-110 transition-transform duration-200">
-                {getPropertyIcon(p.id, p.image)}
-            </div>
-            <div className="text-xs font-black text-slate-800 uppercase tracking-wide leading-tight mb-1">{p.name}</div>
-            <div className="text-[10px] text-yellow-600 font-bold mb-3">+{p.reputationBonus} РЕП/с</div>
-            <div className={`px-3 py-1.5 rounded-lg text-[10px] font-mono font-black ${canBuy ? 'bg-green-100 text-green-700' : 'bg-slate-200 text-slate-500'}`}>
-                ${formatMoney(cost)}
-            </div>
-            {count > 0 && <div className="absolute top-2 right-2 text-[10px] font-black bg-purple-500 text-white w-6 h-6 flex items-center justify-center rounded-full shadow-lg border-2 border-white">{count}</div>}
+          <button key={p.id} onClick={() => buyProperty(p)} disabled={!canBuy} className={`relative overflow-hidden p-4 rounded-3xl flex flex-col items-center text-center transition-all active:scale-95 ${canBuy ? 'bg-surface hover:bg-surfaceHighlight' : 'bg-surface/50 opacity-60'}`}>
+            <div className="text-white mb-2 text-3xl drop-shadow-md">{p.image.includes('http') ? <img src={p.image} className="w-8 h-8"/> : p.image}</div>
+            <div className="text-xs font-black text-white uppercase tracking-wide leading-tight mb-1">{p.name}</div>
+            <div className={`px-3 py-1 rounded-lg text-[10px] font-mono font-bold mt-2 ${canBuy ? 'bg-success text-white' : 'bg-surfaceHighlight text-slate-500'}`}>{formatMoney(cost)}</div>
+            {count > 0 && <div className="absolute top-3 right-3 text-[9px] font-black bg-white text-black w-5 h-5 flex items-center justify-center rounded-full shadow-md">{count}</div>}
           </button>
         )
       })}
     </div>
   );
 
+  // 5. PROFILE (Career + Manual Link)
+  const renderProfile = () => (
+      <div className="animate-fade-in space-y-6 pb-32">
+          <div className="bg-surface text-white p-8 rounded-[3rem] text-center relative overflow-hidden">
+             <div className="absolute inset-0 bg-gradient-to-b from-primary/10 to-transparent"></div>
+             <div className="relative z-10">
+                <div className="w-24 h-24 bg-surfaceHighlight rounded-full mx-auto mb-4 flex items-center justify-center border-4 border-surface shadow-xl">
+                    <img src={characterImage} alt="Character" className="w-full h-full object-cover rounded-full" />
+                </div>
+                <h2 className="text-2xl font-black uppercase mb-1">{stats.currentJob.title}</h2>
+                <div className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-6">Всего заработано: {formatMoney(gameState.lifetimeEarnings)}</div>
+                
+                <div className="grid grid-cols-2 gap-3">
+                     <button onClick={() => setIsManualOpen(true)} className="py-3 bg-surfaceHighlight rounded-2xl text-xs font-black uppercase text-white hover:bg-slate-700 transition-colors flex items-center justify-center gap-2">
+                         <HelpCircle size={16} /> Гайд
+                     </button>
+                     <div className="py-3 bg-surfaceHighlight rounded-2xl text-xs font-black uppercase text-slate-300 flex items-center justify-center gap-2">
+                         <BriefcaseBusiness size={16} /> Тима: {(gameState.workerSalaryRate * 100).toFixed(0)}%
+                     </div>
+                </div>
+             </div>
+           </div>
+
+          <div className="space-y-4">
+             <h3 className="font-black text-slate-500 uppercase text-xs tracking-widest ml-4">Карьерная Лестница</h3>
+             {CAREER_LADDER.map((job, idx) => {
+                const currentIdx = CAREER_LADDER.findIndex(j => j.id === gameState.currentJobId);
+                // Only show active and next 2 jobs
+                if (idx > currentIdx + 2) return null; 
+                // Hide past jobs except previous one
+                if (idx < currentIdx - 1) return null;
+
+                const isCurrent = idx === currentIdx;
+                const isPassed = idx < currentIdx;
+                
+                const hasRep = gameState.reputation >= job.requiredReputation;
+                const hasMoney = gameState.balance >= job.costToPromote;
+                const canPromote = hasRep && hasMoney && idx === currentIdx + 1;
+
+                return (
+                <div key={job.id} className={`p-6 rounded-3xl border-2 ${isCurrent ? 'bg-surface border-primary' : 'bg-surface border-transparent'} ${isPassed ? 'opacity-50' : ''}`}>
+                    <div className="flex justify-between items-center mb-4">
+                        <span className="font-black text-lg text-white">{job.title}</span>
+                        {isCurrent && <div className="bg-primary px-3 py-1 rounded-lg text-[10px] text-white font-bold uppercase">TEКУЩАЯ</div>}
+                        {isPassed && <div className="text-success"><Award size={20} /></div>}
+                        {!isCurrent && !isPassed && <div className="bg-surfaceHighlight px-3 py-1 rounded-lg text-[10px] text-slate-400 font-bold uppercase">LOCKED</div>}
+                    </div>
+                    {!isPassed && !isCurrent && (
+                        <div className="space-y-2 mb-4">
+                            <div className="flex justify-between text-xs text-slate-400">
+                                <span>Цена:</span>
+                                <span className={hasMoney ? 'text-white' : 'text-red-400'}>{formatMoney(job.costToPromote)}</span>
+                            </div>
+                            <div className="flex justify-between text-xs text-slate-400">
+                                <span>Репутация:</span>
+                                <span className={hasRep ? 'text-white' : 'text-red-400'}>{job.requiredReputation}</span>
+                            </div>
+                        </div>
+                    )}
+                    {!isPassed && !isCurrent && (
+                        <button disabled={!canPromote} onClick={() => promote(job.id)} className={`w-full py-3 rounded-2xl font-black text-xs tracking-widest uppercase transition-all active:scale-95 ${canPromote ? 'bg-white text-black' : 'bg-surfaceHighlight text-slate-600'}`}>
+                            Повышение
+                        </button>
+                    )}
+                </div>
+                )
+            })}
+          </div>
+      </div>
+  );
+
+  const renderInfoContent = () => (
+    <div className="space-y-8 animate-fade-in pb-24 text-slate-300">
+        <div className="bg-surfaceHighlight p-6 rounded-3xl border border-white/5">
+            <h3 className="text-xl font-black text-white mb-2">🚀 Быстрый Старт</h3>
+            <ol className="list-decimal list-inside space-y-3 text-sm marker:text-primary marker:font-bold">
+                <li><strong className="text-white">Кликай:</strong> Накопи стартовый капитал тапами.</li>
+                <li><strong className="text-white">Купи Инструменты:</strong> Зайди в "Финансы" -> "Инструменты" и купи VPN/Proxy. Это увеличит доход за клик.</li>
+                <li><strong className="text-white">Найми Команду:</strong> Вкладка "Бизнес" -> "Команда". Найми первого воркера.</li>
+                <li><strong className="text-white">Купи Софт:</strong> Вкладка "Бизнес" -> "Софт". <span className="text-red-400">Без софта воркеры не работают!</span></li>
+            </ol>
+        </div>
+
+        <div className="grid grid-cols-1 gap-4">
+             <div className="bg-surfaceHighlight p-5 rounded-3xl">
+                 <div className="flex items-center gap-3 mb-2">
+                     <Briefcase className="text-primary" size={20}/>
+                     <h4 className="font-black text-white">Бизнес (Пассив)</h4>
+                 </div>
+                 <p className="text-xs leading-relaxed">
+                     Твоя главная машина по добыче денег.
+                     <br/>1. Нанимай людей.
+                     <br/>2. Покупай им Софт.
+                     <br/>3. Лей Трафик (Бизнес -> Трафик), чтобы умножать их доход.
+                 </p>
+             </div>
+
+             <div className="bg-surfaceHighlight p-5 rounded-3xl">
+                 <div className="flex items-center gap-3 mb-2">
+                     <Zap className="text-yellow-500" size={20}/>
+                     <h4 className="font-black text-white">Темки (Риск)</h4>
+                 </div>
+                 <p className="text-xs leading-relaxed">
+                     Временные задачи. Вкладываешь деньги -> Ждешь -> Есть шанс потерять всё или получить х2-х5.
+                 </p>
+             </div>
+
+             <div className="bg-surfaceHighlight p-5 rounded-3xl">
+                 <div className="flex items-center gap-3 mb-2">
+                     <Landmark className="text-success" size={20}/>
+                     <h4 className="font-black text-white">Лимиты Банка</h4>
+                 </div>
+                 <p className="text-xs leading-relaxed">
+                     В начале банк вмещает мало денег. Если банк полон, деньги сгорают.
+                     Заходи в <span className="text-white font-bold">Финансы -> Обмыв</span> и покупай бизнесы (Шаурма, Мойка), чтобы расширить банк.
+                 </p>
+             </div>
+        </div>
+    </div>
+  );
+
+  // Active Mini Game Data
+  const currentMiniGameItem = activeMiniGame ? LAUNDERING_ITEMS.find(i => i.id === activeMiniGame) : null;
+  const currentMiniGameLevel = activeMiniGame ? gameState.launderingUpgrades[activeMiniGame] || 1 : 1;
+
   return (
-    <div className="relative w-full h-screen flex flex-col items-center overflow-hidden font-sans mesh-bg">
+    <div className="relative w-full h-screen flex flex-col overflow-hidden font-sans bg-background text-white selection:bg-primary/30">
       
-      {/* EVENT POPUP */}
+      {/* BACKGROUND PARTICLES */}
+      <div className="absolute inset-0 z-0 pointer-events-none overflow-hidden">
+          <div className="absolute top-[-20%] left-[20%] w-[300px] h-[300px] bg-primary/20 rounded-full blur-[100px] animate-float"></div>
+          <div className="absolute bottom-[-10%] right-[-10%] w-[250px] h-[250px] bg-secondary/10 rounded-full blur-[80px]"></div>
+          <div className="absolute inset-0 bg-grid-pattern opacity-40"></div>
+      </div>
+
+      {/* TOP FLOATING WIDGET */}
+      <div className="relative z-50 w-full pt-8 px-4">
+           <div className="bg-surface/80 backdrop-blur-xl border border-white/5 rounded-[2rem] p-4 shadow-2xl animate-slide-up">
+              <div className="flex items-center justify-between gap-4 mb-3">
+                   {/* Rank Info */}
+                   <div className="flex items-center gap-3">
+                       <div className="w-10 h-10 rounded-full bg-gradient-to-tr from-primary to-accent flex items-center justify-center text-white shadow-lg">
+                           <User size={18} />
+                       </div>
+                       <div className="flex flex-col">
+                           <span className="text-[9px] font-black uppercase text-slate-400 tracking-wider">Должность</span>
+                           <span className="text-xs font-bold text-white">{stats.currentJob.title}</span>
+                       </div>
+                   </div>
+                   
+                   {/* Bank Info */}
+                   <div className="text-right">
+                       <div className="text-[9px] font-black uppercase text-slate-400 tracking-wider mb-0.5">Лимит Банка</div>
+                       <div className={`text-xs font-mono font-black ${stats.isBankFull ? 'text-red-500 animate-pulse' : 'text-slate-200'}`}>
+                           {formatMoney(stats.bankLimit)}
+                       </div>
+                   </div>
+              </div>
+
+              {/* Progress Bar */}
+              <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden relative">
+                   <div 
+                        className={`h-full rounded-full transition-all duration-500 ease-out ${stats.isBankFull ? 'bg-red-500' : 'bg-gradient-to-r from-primary to-accent'}`} 
+                        style={{width: `${limitPercent}%`}}
+                   />
+              </div>
+           </div>
+      </div>
+
+      {/* CENTER STAGE: BALANCE & CHARACTER */}
+      <div className="relative z-10 flex-1 flex flex-col items-center justify-center -mt-8">
+           
+           {/* Character Background Image */}
+           <div className="absolute inset-0 z-0 flex items-center justify-center opacity-40 pointer-events-none translate-y-10">
+              <div className="relative w-full max-w-sm aspect-square">
+                 <img 
+                    src={characterImage} 
+                    alt="Character" 
+                    className="w-full h-full object-contain drop-shadow-2xl filter grayscale-[0.2]" 
+                 />
+                 <div className="absolute inset-0 bg-gradient-to-t from-background via-transparent to-transparent"></div>
+              </div>
+           </div>
+
+           <div className="relative z-10 flex flex-col items-center animate-bounce-soft">
+               <span className="text-[9px] font-black text-slate-500 uppercase tracking-[0.4em] mb-2 bg-surfaceHighlight/50 backdrop-blur-sm px-3 py-1 rounded-full border border-white/5">БАЛАНС</span>
+               <h1 className={`text-6xl sm:text-7xl font-mono font-black tracking-tight transition-all duration-300 drop-shadow-2xl ${stats.isBankFull ? 'text-red-500' : 'text-white'}`}>
+                  {formatMoney(gameState.balance)}
+               </h1>
+               <div className="mt-3 text-sm font-bold text-success bg-surfaceHighlight/80 backdrop-blur-sm border border-white/5 px-4 py-1.5 rounded-xl flex items-center gap-2">
+                   <Battery size={14} className="animate-pulse"/>
+                   +{formatMoney(stats.totalPassiveIncome)} / сек
+               </div>
+           </div>
+           
+           {/* Floating Particles Area */}
+           <div className="absolute inset-0 pointer-events-none overflow-hidden z-20">
+                {clicks.map(c => (
+                  <div key={c.id} className="float-text text-4xl font-black text-white drop-shadow-lg" style={{left: c.x, top: c.y}}>
+                     {c.val}
+                  </div>
+                ))}
+           </div>
+      </div>
+
+      {/* BOTTOM ACTION: CLICKER */}
+      <div className="relative z-20 pb-28 w-full flex justify-center">
+          <ClickerCircle onClick={handleClick} clickValue={stats.currentClickValue} />
+      </div>
+
+      {/* MODALS AND NAV */}
       {activeEvent && (
-        <div className="absolute top-24 z-50 w-[90%] bg-white border-l-8 border-l-purple-500 p-5 rounded-r-2xl animate-slide-in shadow-2xl flex items-center gap-4">
-             <div className="text-3xl">{activeEvent.type === 'GOOD' ? '🤑' : '👮‍♂️'}</div>
+        <div className="fixed top-24 left-4 right-4 z-[70] bg-surface p-6 rounded-3xl animate-pop shadow-2xl flex items-center gap-4">
+             <div className="text-4xl">{activeEvent.type === 'GOOD' ? '🎉' : '👮'}</div>
              <div>
-                <div className="text-sm font-black text-slate-800 uppercase">{activeEvent.title}</div>
-                <div className="text-xs text-slate-500 font-medium">{activeEvent.message}</div>
-                <div className={`text-sm font-mono font-black mt-1 ${activeEvent.type === 'GOOD' ? 'text-green-500' : 'text-red-500'}`}>
+                <div className="text-sm font-black text-white uppercase mb-1">{activeEvent.title}</div>
+                <div className="text-xs text-slate-400 font-medium leading-tight">{activeEvent.message}</div>
+                <div className={`text-sm font-mono font-black mt-2 ${activeEvent.type === 'GOOD' ? 'text-success' : 'text-red-400'}`}>
                     {activeEvent.type === 'GOOD' ? '+' : ''}{activeEvent.effectValue > 0 ? formatMoney(activeEvent.effectValue) : (activeEvent.effectValue * 100).toFixed(0) + '%'}
                 </div>
             </div>
         </div>
       )}
 
-      {/* OFFLINE MODAL */}
       {offlineEarnings !== null && (
-        <div className="fixed inset-0 z-[100] bg-slate-900/60 flex items-center justify-center p-6 backdrop-blur-sm">
-           <div className="bg-white w-full max-w-sm p-8 rounded-[2.5rem] text-center shadow-2xl border-4 border-white transform scale-100">
-             <div className="text-6xl mb-6 animate-bounce">💰</div>
-             <h2 className="text-2xl font-black text-slate-800 mb-2 uppercase tracking-wide">Пока ты спал</h2>
-             <p className="text-sm text-slate-500 mb-8 font-medium">Твои боты продолжали работать и принесли тебе кучу денег!</p>
-             <div className="text-5xl font-black text-green-500 mb-8 font-mono tracking-tighter">+${formatMoney(offlineEarnings)}</div>
-             <button onClick={() => setOfflineEarnings(null)} className="w-full py-4 bg-green-500 text-white font-black uppercase tracking-widest rounded-2xl hover:bg-green-600 shadow-lg shadow-green-200 transition-all active:scale-95">Забрать кэш</button>
+        <div className="fixed inset-0 z-[100] bg-black/80 flex items-center justify-center p-6 backdrop-blur-md">
+           <div className="bg-surface w-full max-w-sm p-8 rounded-[3rem] text-center shadow-2xl relative overflow-hidden animate-pop">
+             <div className="absolute inset-0 bg-gradient-to-b from-primary/20 to-transparent pointer-events-none"></div>
+             <div className="relative z-10">
+                 <div className="text-6xl mb-6 animate-bounce">💰</div>
+                 <h2 className="text-xl font-black text-white mb-2 uppercase tracking-widest">С Возвращением!</h2>
+                 <p className="text-xs text-slate-400 mb-8 font-bold">Пока тебя не было, тима заработала:</p>
+                 <div className="text-5xl font-black text-white mb-8 font-mono tracking-tighter">+{formatMoney(offlineEarnings)}</div>
+                 <button onClick={() => setOfflineEarnings(null)} className="w-full py-4 bg-primary text-white font-black uppercase tracking-widest rounded-2xl hover:bg-primary/90 transition-all active:scale-95 shadow-xl shadow-primary/30">ЗАБРАТЬ КЭШ</button>
+             </div>
            </div>
         </div>
       )}
 
-      {/* --- DASHBOARD WIDGET --- */}
-      <div className="w-full px-6 pt-10 pb-2 z-20 flex flex-col gap-3">
-         {/* Top Row: Status & Wanted Level */}
-         <div className="flex justify-between items-end px-1">
-            <div>
-                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-0.5">Статус</div>
-                <div className="text-xl font-black text-slate-700 leading-none drop-shadow-sm">{currentJob.title}</div>
-            </div>
-            <div className="flex flex-col items-end gap-1 pb-1">
-               {renderStars(wantedLevel)}
-            </div>
-         </div>
-
-         {/* Bottom Row: Stats Pills (Split) */}
-         <div className="grid grid-cols-2 gap-3">
-             <div className="bg-white/60 backdrop-blur-md p-3 rounded-2xl border border-white/50 flex items-center gap-3 shadow-sm">
-                 <div className="w-8 h-8 rounded-full bg-green-100 flex items-center justify-center text-green-600 shrink-0">
-                    <MousePointer size={14} />
-                 </div>
-                 <div>
-                     <div className="text-[9px] text-slate-400 font-bold uppercase leading-none mb-0.5">За клик</div>
-                     <div className="text-sm font-black text-slate-700 leading-none">+${formatMoney(currentClickValue)}</div>
-                 </div>
-             </div>
-             
-             <div className="bg-white/60 backdrop-blur-md p-3 rounded-2xl border border-white/50 flex items-center gap-3 shadow-sm">
-                 <div className="w-8 h-8 rounded-full bg-purple-100 flex items-center justify-center text-purple-600 shrink-0">
-                    <Wallet size={14} />
-                 </div>
-                 <div>
-                     <div className="text-[9px] text-slate-400 font-bold uppercase leading-none mb-0.5">В секунду</div>
-                     <div className="text-sm font-black text-slate-700 leading-none">+${formatMoney(effectivePassiveIncome)}</div>
-                 </div>
-             </div>
-         </div>
-      </div>
-
-      {/* MAIN BALANCE AREA */}
-      <div className="flex-1 flex flex-col items-center justify-center w-full z-10 -mt-6">
-        <div className="text-center mb-4 relative">
-            <div className="text-[10px] text-slate-400 font-black tracking-[0.3em] uppercase mb-2">Твой Баланс</div>
-            <div className="text-6xl sm:text-7xl font-black text-slate-800 drop-shadow-sm font-mono tracking-tighter flex items-center justify-center gap-2">
-                {formatMoney(gameState.balance)}
-            </div>
-             <div className="flex justify-center gap-3 mt-4">
-               <div className="px-3 py-1.5 bg-yellow-100 text-yellow-700 rounded-full flex items-center gap-1.5 shadow-sm border border-yellow-200">
-                 <Award size={14} className="text-yellow-600"/>
-                 <span className="text-[11px] font-bold">{Math.floor(gameState.reputation)} Реп</span>
-               </div>
-               {trafficMultiplier > 1 && (
-                 <div className="px-3 py-1.5 bg-orange-100 text-orange-700 rounded-full flex items-center gap-1.5 shadow-sm border border-orange-200">
-                   <TrendingUp size={14} className="text-orange-600"/>
-                   <span className="text-[11px] font-bold">x{trafficMultiplier.toFixed(1)} Буст</span>
-                 </div>
-               )}
-            </div>
-        </div>
-
-        {/* CLICKER INTERFACE */}
-        <div className="w-full max-w-[400px] aspect-square relative flex items-center justify-center">
-            <ClickerCircle onClick={handleClick} clickValue={currentClickValue} />
-            
-            {/* Click Particles */}
-            {clicks.map(c => (
-              <div key={c.id} className="float-text text-4xl font-black text-green-500 pointer-events-none flex items-center gap-1" style={{left: c.x, top: c.y}}>
-                 {c.val}
-              </div>
-            ))}
-        </div>
-      </div>
+      {activeMiniGame && currentMiniGameItem && (
+          <MiniGameModal 
+            businessId={activeMiniGame}
+            businessLevel={currentMiniGameLevel}
+            baseIncome={currentMiniGameItem.baseIncome}
+            onClose={() => setActiveMiniGame(null)}
+            onComplete={handleMiniGameComplete}
+          />
+      )}
 
       <Navigation activeTab={activeTab} onTabChange={setActiveTab} />
-
-      {/* BOTTOM SHEETS */}
-      <BottomSheet isOpen={activeTab === Tab.MARKET} onClose={() => setActiveTab(Tab.CLICKER)} title="Черный Рынок">
-        {renderMarket()}
-      </BottomSheet>
       
-      <BottomSheet isOpen={activeTab === Tab.MANAGEMENT} onClose={() => setActiveTab(Tab.CLICKER)} title="Синдикат">
-        {renderManagement()}
+      {/* --- CONTENT BOTTOM SHEETS --- */}
+      
+      {/* 1. BUSINESS (Team, Soft, Traffic) */}
+      <BottomSheet isOpen={activeTab === Tab.MANAGEMENT} onClose={() => setActiveTab(Tab.CLICKER)} title="Бизнес">
+        {renderBusiness()}
       </BottomSheet>
 
-      <BottomSheet isOpen={activeTab === Tab.LIFESTYLE} onClose={() => setActiveTab(Tab.CLICKER)} title="Роскошь">
+      {/* 2. SCHEMES (Active, Dark Market) */}
+      <BottomSheet isOpen={activeTab === Tab.SCHEMES} onClose={() => setActiveTab(Tab.CLICKER)} title="Темки">
+        {renderSchemesTab()}
+      </BottomSheet>
+
+      {/* 3. FINANCE (Laundering, Exchange, Tools) */}
+      <BottomSheet isOpen={activeTab === Tab.MARKET} onClose={() => setActiveTab(Tab.CLICKER)} title="Финансы">
+        {renderFinanceTab()}
+      </BottomSheet>
+
+      {/* 4. LIFESTYLE (Properties) */}
+      <BottomSheet isOpen={activeTab === Tab.LIFESTYLE} onClose={() => setActiveTab(Tab.CLICKER)} title="Лакшери">
         {renderLifestyle()}
+      </BottomSheet>
+
+      {/* 5. PROFILE (Stats, Manual) */}
+      <BottomSheet isOpen={activeTab === Tab.PROFILE} onClose={() => setActiveTab(Tab.CLICKER)} title="Профиль">
+        {renderProfile()}
+      </BottomSheet>
+
+      {/* MANUAL OVERLAY */}
+      <BottomSheet isOpen={isManualOpen} onClose={() => setIsManualOpen(false)} title="Как играть?">
+         {renderInfoContent()}
       </BottomSheet>
 
     </div>
